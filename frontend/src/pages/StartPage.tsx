@@ -7,6 +7,16 @@ export function StartPage() {
   const navigate = useNavigate()
   const [resetState, setResetState] = useState<'resetting' | 'ready' | 'error'>('resetting')
   const [resetMessage, setResetMessage] = useState('正在清空上次运行记录并准备新的真实会话。')
+  const [bootStep, setBootStep] = useState(0)
+
+  useEffect(() => {
+    const timers = [
+      window.setTimeout(() => setBootStep(1), 420),
+      window.setTimeout(() => setBootStep(2), 840),
+      window.setTimeout(() => setBootStep(3), 1260),
+    ]
+    return () => timers.forEach((timer) => window.clearTimeout(timer))
+  }, [])
 
   useEffect(() => {
     let active = true
@@ -42,16 +52,28 @@ export function StartPage() {
     <div className="timeline-shell">
       <div className="timeline-shell__frame timeline-shell__frame--entry">
         <section className="entry-screen">
+          <div className="entry-launch-beam" aria-hidden="true" />
           <div className="entry-screen__brand">
             <span className="timeline-header__eyebrow">HelioPrior</span>
-            <h1>准备启动新的科研闭环</h1>
+            <h1>开启新的科研之旅</h1>
             <p>从中央控制智能体入口录入科学问题、上传知识材料与实验数据，再进入主流程工作台推进真实运行。</p>
-            <div className={`timeline-empty-state${resetState === 'error' ? ' timeline-empty-state--error' : ''}`}>
+            <ol className="entry-launch__steps" aria-label="启动状态">
+              <li className={`entry-launch__step ${bootStep >= 1 ? 'entry-launch__step--done' : bootStep === 0 ? 'entry-launch__step--active' : ''}`}>
+                你好，我是先羲 HelioPrior
+              </li>
+              <li className={`entry-launch__step ${bootStep >= 2 ? 'entry-launch__step--done' : bootStep === 1 ? 'entry-launch__step--active' : ''}`}>
+                某处，有不可思议的事物等待被发现
+              </li>
+              <li className={`entry-launch__step ${bootStep >= 3 ? 'entry-launch__step--done' : bootStep === 2 ? 'entry-launch__step--active' : ''}`}>
+                请说出你的科学问题，让我们一起探索
+              </li>
+            </ol>
+            <div className={`entry-launch__note${resetState === 'error' ? ' entry-launch__note--error' : ''}`}>
               {resetMessage}
             </div>
           </div>
 
-          <div className="entry-screen__actions">
+          <div className={`entry-screen__actions${bootStep >= 3 ? ' entry-screen__actions--ready' : ''}`}>
             <button
               type="button"
               className="entry-screen__button entry-screen__button--primary"
