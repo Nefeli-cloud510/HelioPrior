@@ -8,7 +8,7 @@ import shutil
 import sys
 import threading
 import traceback
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1954,6 +1954,18 @@ RESEARCH_V2_API = ResearchV2Api(
 )
 
 
+def _json_default(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, timedelta):
+        return value.total_seconds()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="replace")
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+
 class LiveWorkflowHandler(BaseHTTPRequestHandler):
     server_version = "HelioPriorLiveServer/1.0"
 
@@ -2096,7 +2108,9 @@ class LiveWorkflowHandler(BaseHTTPRequestHandler):
 
     def _write_json(self, payload: dict[str, Any], status: int = HTTPStatus.OK) -> None:
         self._set_headers(status=status)
-        self.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        self.wfile.write(
+            json.dumps(payload, ensure_ascii=False, default=_json_default).encode("utf-8")
+        )
 
     def _handle_report_export(self) -> None:
         try:
