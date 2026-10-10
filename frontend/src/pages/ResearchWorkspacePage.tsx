@@ -743,6 +743,9 @@ function ResearchProjectDetailView({ researchId }: { researchId: string }) {
               <Link className="research-primary" to={`/research/${researchId}/evidence`}>
                 打开证据中心
               </Link>
+              <Link className="research-secondary" to={`/execution?research_id=${encodeURIComponent(researchId)}`}>
+                查看原始执行
+              </Link>
               <button className="research-secondary" type="button" onClick={() => void refresh()}>
                 刷新项目
               </button>

@@ -77,9 +77,9 @@ export function StartPage() {
             <button
               type="button"
               className="entry-screen__button entry-screen__button--primary"
-              onClick={() => navigate('/dialogue')}
+              onClick={() => navigate('/research')}
             >
-              进入中央控制页
+              进入研究工作台
             </button>
             <button
               type="button"
@@ -87,6 +87,13 @@ export function StartPage() {
               onClick={() => navigate('/workflow')}
             >
               打开主工作台
+            </button>
+            <button
+              type="button"
+              className="entry-screen__button"
+              onClick={() => navigate('/dialogue')}
+            >
+              进入中央控制页
             </button>
           </div>
         </section>

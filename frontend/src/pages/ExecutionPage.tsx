@@ -1,4 +1,6 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { createResearchProject } from '../api/researchApi'
 import { DataCoverageAudit } from '../components/DataCoverageAudit'
 import { ModelTuningCard } from '../components/ModelTuningCard'
 import { PageTabs } from '../components/PageTabs'
@@ -55,7 +57,10 @@ function isExecutionActive(sessionStatus: { status?: string; stage?: string; mes
 }
 
 export function ExecutionPage() {
+  const navigate = useNavigate()
   const { data, loading, error, refresh, refreshing } = useTimelineBundle()
+  const [importing, setImporting] = useState(false)
+  const [importError, setImportError] = useState<string | null>(null)
   const monitor = data?.viewModels.processMonitor
   const experiment = data?.viewModels.experimentEvaluation
   const report = data?.viewModels.roundReport
@@ -103,6 +108,60 @@ export function ExecutionPage() {
   }, [experiment?.visualizationItems])
   const executedExperimentId = experiment?.executedExperimentId ?? '--'
 
+  async function importIntoResearchWorkbench() {
+    const task = data?.snapshot?.task
+    if (!task) {
+      setImportError('当前会话没有可导入的任务数据，请先在经典科研闭环中建立科学问题。')
+      return
+    }
+    setImporting(true)
+    setImportError(null)
+    try {
+      const questionPayload = task?.payload?.research_question ?? {}
+      const question =
+        typeof questionPayload?.text === 'string' && questionPayload.text.trim()
+          ? questionPayload.text.trim()
+          : typeof data?.snapshot?.plannerInput?.scientific_question === 'string'
+            ? data.snapshot.plannerInput.scientific_question
+            : '由经典科研闭环导入的历史研究问题'
+      const targetLabel =
+        typeof questionPayload?.target === 'string' && questionPayload.target.trim()
+          ? questionPayload.target.trim()
+          : typeof questionPayload?.variables?.y === 'string' && questionPayload.variables.y.trim()
+            ? questionPayload.variables.y.trim()
+            : 'imf_by_gse'
+      const targetColumn =
+        typeof questionPayload?.variables?.y === 'string' && questionPayload.variables.y.trim()
+          ? questionPayload.variables.y.trim()
+          : targetLabel
+      const claimStatement =
+        report?.threeLayerConclusion?.overallSummary?.trim() ||
+        report?.threeLayerConclusion?.scientificLayer?.answer?.trim() ||
+        report?.scientificConclusions?.find((item) => item.trim()) ||
+        question
+      const result = await createResearchProject({
+        workflow_mode: 'research_review',
+        entry_mode: 'import_claim',
+        data_mode: 'historical_replay',
+        title: `由 legacy 第 ${currentRoundNumber} 轮导入`,
+        question,
+        claim_statement: claimStatement,
+        target: {
+          id: targetLabel,
+          column: targetColumn,
+          unit: 'nT',
+          coordinate_system: 'GSE',
+        },
+        horizon_days: 3,
+      })
+      navigate(`/research/${result.researchId}`)
+    } catch (caught) {
+      setImportError(caught instanceof Error ? caught.message : '研究工作台项目创建失败。')
+    } finally {
+      setImporting(false)
+    }
+  }
+
   return (
     <div className="timeline-shell">
       <div className="timeline-shell__frame timeline-shell__frame--detail">
@@ -127,6 +186,14 @@ export function ExecutionPage() {
                 </div>
 
                 <div className="detail-page__meta">
+                  <button
+                    type="button"
+                    className="detail-link detail-link--button"
+                    disabled={importing}
+                    onClick={() => void importIntoResearchWorkbench()}
+                  >
+                    {importing ? '导入中…' : '导入研究工作台'}
+                  </button>
                   <button
                     type="button"
                     className="detail-link detail-link--button"
@@ -156,6 +223,11 @@ export function ExecutionPage() {
               {executionActive ? (
                 <div className="execution-running-banner">
                   {sessionStatus?.message ?? '正在执行实验并生成结果，完成后本页会自动展示最新产物。'}
+                </div>
+              ) : null}
+              {importError ? (
+                <div className="timeline-empty-state timeline-empty-state--error">
+                  {importError}
                 </div>
               ) : null}
 
