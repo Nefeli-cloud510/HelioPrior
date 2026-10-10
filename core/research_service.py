@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
+import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +16,7 @@ from core.evidence_builder import (
     parse_source_content,
     summarize_preflight,
 )
+from core.protocol_hash import protocol_hash
 from core.research_repository import (
     ResearchProjectNotFoundError,
     ResearchRepository,
@@ -42,6 +46,9 @@ from core.research_validation import (
     ResearchValidationError,
     ValidationPlanner,
 )
+
+
+LEGACY_SESSION_BASE = Path(__file__).resolve().parent.parent / "runtime" / "live_session"
 
 
 class ResearchApiError(RuntimeError):
@@ -79,12 +86,16 @@ class ResearchService:
         data_source: Any | None = None,
         harness_project_root: Path | None = None,
         run_shap: bool = False,
+        legacy_session_root: Path | None = None,
     ) -> None:
         self.repository = repository
         self.gateway = gateway
         self.data_source = data_source
         self.harness_project_root = harness_project_root
         self.run_shap = run_shap
+        self.legacy_session_root = (
+            legacy_session_root or LEGACY_SESSION_BASE
+        ).resolve()
         self.validation_planner = ValidationPlanner(
             repository,
             gateway=gateway,
@@ -248,6 +259,485 @@ class ResearchService:
         result = self._project_response(next_state, created=False)
         result.payload["data"]["artifact"] = artifact.model_dump(exclude_none=True)
         return ApiResult(status=201, payload=result.payload)
+
+    def import_legacy_round(
+        self,
+        research_id: str,
+        expected_revision: int,
+        payload: dict[str, Any],
+    ) -> ApiResult:
+        try:
+            current = self.repository.load_revision(research_id)
+        except ResearchProjectNotFoundError:
+            raise ResearchApiError(
+                "研究项目不存在。",
+                status=404,
+                code="project_not_found",
+            )
+        try:
+            expected = int(expected_revision)
+        except (TypeError, ValueError):
+            raise ResearchApiError(
+                "expected_revision 必须是整数。",
+                status=422,
+                code="invalid_revision",
+            )
+        if current.revision != expected:
+            raise ResearchApiError(
+                f"版本冲突：当前 revision={current.revision}。",
+                status=409,
+                code="revision_conflict",
+                retryable=True,
+            )
+
+        session_root = self._resolve_legacy_session(payload)
+        round_number = self._resolve_legacy_round_number(session_root, payload)
+        round_dir = session_root / "results" / f"round_{round_number:02d}"
+        protocol_path = round_dir / "protocol.json"
+        if not protocol_path.is_file():
+            protocol_path = session_root / "config" / "latest_protocol.json"
+        if not protocol_path.is_file():
+            raise ResearchApiError(
+                f"legacy 第 {round_number} 轮缺少 protocol.json，无法生成协议哈希。",
+                status=422,
+                code="legacy_protocol_missing",
+            )
+        try:
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ResearchApiError(
+                f"legacy 协议文件不可读：{protocol_path.name}",
+                status=422,
+                code="legacy_protocol_invalid",
+                details={"error": str(exc)},
+            ) from exc
+
+        experiment_id = str(
+            payload.get("experiment_id") or protocol.get("experiment_id") or ""
+        ).strip() or None
+        baseline_path, treatment_path, resolved_experiment_id = (
+            self._resolve_legacy_experiment(
+                session_root,
+                round_dir,
+                experiment_id,
+            )
+        )
+        try:
+            horizon_days = int(
+                payload.get("horizon_days")
+                or protocol.get("forecast_horizon_days")
+                or current.project.horizon_days
+            )
+        except (TypeError, ValueError):
+            raise ResearchApiError(
+                "legacy 协议中的 forecast_horizon_days 不是整数。",
+                status=422,
+                code="invalid_horizon",
+            )
+
+        protocol_hash_value = protocol_hash(protocol)
+        prediction_csv = self._build_legacy_prediction_csv(
+            baseline_path,
+            treatment_path,
+            experiment_id=resolved_experiment_id,
+            horizon_days=horizon_days,
+            protocol_hash_value=protocol_hash_value,
+        )
+        prediction_file_name = (
+            f"legacy_round_{round_number:02d}_{resolved_experiment_id}_predictions.csv"
+        )
+        prediction_artifact = self._make_artifact_record(
+            research_id,
+            file_name=prediction_file_name,
+            kind="prediction_csv",
+            content=prediction_csv,
+            source_kind="legacy_import",
+        )
+        protocol_artifact = self._make_artifact_record(
+            research_id,
+            file_name=f"legacy_round_{round_number:02d}_protocol.json",
+            kind="protocol_json",
+            content=json.dumps(protocol, ensure_ascii=False, indent=2),
+            source_kind="legacy_import",
+        )
+
+        evidence_bundle = self._build_legacy_evidence_bundle(
+            session_root,
+            round_dir,
+            round_number=round_number,
+            experiment_id=resolved_experiment_id,
+            protocol=protocol,
+        )
+        evidence_artifact = self._make_artifact_record(
+            research_id,
+            file_name=f"legacy_round_{round_number:02d}_evidence_bundle.json",
+            kind="evidence_json",
+            content=json.dumps(evidence_bundle, ensure_ascii=False, indent=2),
+            source_kind="legacy_import",
+        )
+
+        target_label = str(
+            payload.get("target_id") or protocol.get("target") or current.project.target.id
+        ).strip()
+        target_unit = _unit_for_target(target_label) or current.project.target.unit
+
+        def apply_import(state: ResearchRevision) -> None:
+            state.project.target = ResearchTarget(
+                id=target_label,
+                column=target_label,
+                unit=target_unit,
+                coordinate_system=current.project.target.coordinate_system
+                or "GSE",
+            )
+            state.project.horizon_days = horizon_days
+            state.artifacts.extend(
+                [prediction_artifact, protocol_artifact, evidence_artifact]
+            )
+
+        next_state = self.repository.mutate(
+            research_id,
+            expected_revision=expected,
+            mutation=apply_import,
+        )
+        result = self.preflight(
+            research_id,
+            expected_revision=next_state.revision,
+            payload={
+                "artifact_id": prediction_artifact.artifact_id,
+                "protocol_hash_value": protocol_hash_value,
+                "run_id": resolved_experiment_id,
+                "horizon_days": horizon_days,
+                "base_arm": "baseline",
+                "aug_arm": "treatment",
+                "feature_columns": _protocol_feature_columns(protocol),
+            },
+        )
+        result.payload["data"]["legacy_import"] = {
+            "session_name": session_root.name,
+            "session_root": str(session_root),
+            "round_number": round_number,
+            "experiment_id": resolved_experiment_id,
+            "protocol_hash": protocol_hash_value,
+            "prediction_artifact_id": prediction_artifact.artifact_id,
+            "protocol_artifact_id": protocol_artifact.artifact_id,
+            "evidence_artifact_id": evidence_artifact.artifact_id,
+            "preflight_status": result.payload["data"]["preflight"]["status"],
+        }
+        return ApiResult(status=200, payload=result.payload)
+
+    def _resolve_legacy_session(self, payload: dict[str, Any]) -> Path:
+        base = self.legacy_session_root
+        if not base.is_dir():
+            raise ResearchApiError(
+                f"legacy 会话目录不存在：{base}",
+                status=409,
+                code="legacy_session_missing",
+            )
+        candidates: list[Path] = []
+        if self._has_round_results(base):
+            candidates.append(base)
+        current = base / "current"
+        if current.is_dir() and self._has_round_results(current):
+            candidates.append(current)
+        for child in sorted(
+            base.iterdir(),
+            key=lambda path: path.stat().st_mtime if path.is_dir() else 0,
+            reverse=True,
+        ):
+            if (
+                child.is_dir()
+                and child.name != "current"
+                and self._has_round_results(child)
+            ):
+                candidates.append(child)
+        if not candidates:
+            raise ResearchApiError(
+                f"当前没有可导入的 legacy 科研会话：{base} 下未找到含轮次产物的目录。",
+                status=409,
+                code="legacy_round_missing",
+            )
+        requested = str(payload.get("session_name") or "").strip()
+        if requested:
+            chosen = next(
+                (candidate for candidate in candidates if candidate.name == requested),
+                None,
+            )
+            if chosen is None:
+                raise ResearchApiError(
+                    f"指定的 legacy 会话不存在或没有轮次产物：{requested}",
+                    status=404,
+                    code="legacy_session_not_found",
+                )
+            return chosen
+        return candidates[0]
+
+    @staticmethod
+    def _has_round_results(session_root: Path) -> bool:
+        results = session_root / "results"
+        return results.is_dir() and any(
+            child.is_dir() for child in results.glob("round_*")
+        )
+
+    @staticmethod
+    def _resolve_legacy_round_number(
+        session_root: Path,
+        payload: dict[str, Any],
+    ) -> int:
+        raw_round = payload.get("round_number")
+        results = session_root / "results"
+        if raw_round is not None:
+            try:
+                round_number = int(raw_round)
+            except (TypeError, ValueError):
+                raise ResearchApiError(
+                    "round_number 必须是整数。",
+                    status=422,
+                    code="invalid_round_number",
+                )
+            if round_number < 1:
+                raise ResearchApiError(
+                    "round_number 必须大于等于 1。",
+                    status=422,
+                    code="invalid_round_number",
+                )
+            round_dir = results / f"round_{round_number:02d}"
+            if not round_dir.is_dir():
+                raise ResearchApiError(
+                    f"legacy 会话中不存在第 {round_number} 轮。",
+                    status=404,
+                    code="legacy_round_not_found",
+                )
+            return round_number
+        matches: list[int] = []
+        for path in results.glob("round_*"):
+            if not path.is_dir():
+                continue
+            try:
+                matches.append(int(path.name.removeprefix("round_")))
+            except ValueError:
+                continue
+        if not matches:
+            raise ResearchApiError(
+                "legacy 会话没有可导入的轮次。",
+                status=409,
+                code="legacy_round_missing",
+            )
+        return max(matches)
+
+    def _resolve_legacy_experiment(
+        self,
+        session_root: Path,
+        round_dir: Path,
+        experiment_id: str | None,
+    ) -> tuple[Path, Path, str]:
+        if experiment_id:
+            experiment_dir = round_dir / experiment_id
+            baseline_path, treatment_path = self._prediction_pair(experiment_dir)
+            if baseline_path.is_file() and treatment_path.is_file():
+                return baseline_path, treatment_path, experiment_id
+
+        result_path = round_dir / "result_unified.json"
+        if result_path.is_file():
+            try:
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                result = {}
+            result_experiment_id = str(result.get("experiment_id") or "").strip()
+            run_paths: dict[str, Path] = {}
+            for run in result.get("runs") or []:
+                run_id = str(run.get("run_id") or "").strip().lower()
+                relative = str(run.get("prediction_artifact") or "").strip()
+                if not run_id or not relative:
+                    continue
+                candidate = session_root / relative.lstrip("/\\")
+                if not candidate.is_file():
+                    candidate = round_dir / relative.lstrip("/\\")
+                if candidate.is_file():
+                    run_paths[run_id] = candidate
+            baseline_path = run_paths.get("baseline")
+            treatment_path = run_paths.get("treatment")
+            if baseline_path and treatment_path and baseline_path.is_file() and treatment_path.is_file():
+                return (
+                    baseline_path,
+                    treatment_path,
+                    result_experiment_id or experiment_id or round_dir.name,
+                )
+
+        candidates: list[tuple[Path, Path]] = []
+        for baseline in sorted(round_dir.glob("E_*/predictions/*_baseline.csv")):
+            treatment = baseline.with_name(
+                baseline.name.replace("_baseline.csv", "_treatment.csv")
+            )
+            if treatment.is_file():
+                candidates.append((baseline, treatment))
+        if not candidates:
+            raise ResearchApiError(
+                f"legacy 第 {round_dir.name} 轮没有可导入的 baseline/treatment 预测 CSV。",
+                status=422,
+                code="legacy_predictions_missing",
+            )
+        baseline_path, treatment_path = max(
+            candidates,
+            key=lambda pair: pair[0].stat().st_mtime,
+        )
+        return (
+            baseline_path,
+            treatment_path,
+            baseline_path.parent.parent.name,
+        )
+
+    @staticmethod
+    def _prediction_pair(experiment_dir: Path) -> tuple[Path, Path]:
+        predictions = experiment_dir / "predictions"
+        baselines = sorted(predictions.glob("*_baseline.csv")) if predictions.is_dir() else []
+        if not baselines:
+            return Path(""), Path("")
+        baseline_path = baselines[0]
+        treatment_path = baseline_path.with_name(
+            baseline_path.name.replace("_baseline.csv", "_treatment.csv")
+        )
+        if not treatment_path.is_file():
+            return Path(""), Path("")
+        return baseline_path, treatment_path
+
+    @staticmethod
+    def _build_legacy_prediction_csv(
+        baseline_path: Path,
+        treatment_path: Path,
+        *,
+        experiment_id: str,
+        horizon_days: int,
+        protocol_hash_value: str,
+    ) -> str:
+        rows: list[dict[str, Any]] = []
+        for arm, path in (
+            ("baseline", baseline_path),
+            ("treatment", treatment_path),
+        ):
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                for raw in reader:
+                    row = {str(key): value for key, value in raw.items()}
+                    row["arm"] = arm
+                    if not str(row.get("split") or "").strip():
+                        row["split"] = "test"
+                    if not str(row.get("run_id") or "").strip():
+                        row["run_id"] = arm
+                    if not str(row.get("horizon_days") or "").strip():
+                        row["horizon_days"] = str(horizon_days)
+                    if not str(row.get("protocol_hash") or "").strip():
+                        row["protocol_hash"] = protocol_hash_value
+                    target_time = str(
+                        row.get("target_time") or row.get("time") or row.get("date") or ""
+                    ).strip() or None
+                    if target_time and not str(
+                        row.get("target_time") or ""
+                    ).strip():
+                        row["target_time"] = target_time
+                    if not str(row.get("forecast_origin") or "").strip() and target_time:
+                        row["forecast_origin"] = _calendar_shift(
+                            target_time,
+                            -horizon_days,
+                        )
+                    rows.append(row)
+
+        fieldnames: list[str] = []
+        for row in rows:
+            for key in row:
+                if key not in fieldnames:
+                    fieldnames.append(key)
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=fieldnames, lineterminator="\n")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+        text = output.getvalue()
+        if not text.strip():
+            raise ResearchApiError(
+                "legacy 预测文件为空，无法生成配对证据。",
+                status=422,
+                code="legacy_predictions_missing",
+            )
+        return text
+
+    def _make_artifact_record(
+        self,
+        research_id: str,
+        *,
+        file_name: str,
+        kind: str,
+        content: str,
+        source_kind: str,
+    ) -> ArtifactRecord:
+        text_content = (
+            content.decode("utf-8", errors="replace")
+            if isinstance(content, (bytes, bytearray))
+            else content
+        )
+        parsed_source = parse_source_content(kind, text_content, file_name)
+        artifact_id = "ART_" + uuid.uuid4().hex[:12].upper()
+        stored_path = self.repository.store_artifact(
+            research_id,
+            artifact_id,
+            text_content,
+        )
+        now = datetime.now()
+        return ArtifactRecord(
+            artifact_id=artifact_id,
+            file_name=file_name,
+            sha256=hashlib.sha256(text_content.encode("utf-8")).hexdigest(),
+            size_bytes=len(text_content.encode("utf-8")),
+            kind=kind,
+            stored_path=str(stored_path),
+            parsed=not bool(parsed_source.parse_errors),
+            parse_errors=list(parsed_source.parse_errors),
+            created_at=now,
+            updated_at=now,
+            source_kind=source_kind,
+            schema_version=SCHEMA_VERSION,
+        )
+
+    @staticmethod
+    def _build_legacy_evidence_bundle(
+        session_root: Path,
+        round_dir: Path,
+        *,
+        round_number: int,
+        experiment_id: str,
+        protocol: dict[str, Any],
+    ) -> dict[str, Any]:
+        def read_json(path: Path) -> Any:
+            if not path.is_file():
+                return None
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None
+
+        evaluation = read_json(round_dir / "evaluation_unified.json")
+        result = read_json(round_dir / "result_unified.json")
+        hypothesis_tree = read_json(session_root / "state" / "hypothesis_tree.json")
+        decision_log = read_json(session_root / "state" / "decision_log.json")
+        task = read_json(session_root / "state" / "task.json")
+        return {
+            "bundle_kind": "legacy_round_import",
+            "round_number": round_number,
+            "experiment_id": experiment_id,
+            "protocol": protocol,
+            "evaluation": evaluation,
+            "result": result,
+            "hypothesis_tree": hypothesis_tree,
+            "decision_log": decision_log,
+            "task": task,
+            "metrics": (evaluation or {}).get("metrics"),
+            "source_files": {
+                "protocol": str(round_dir / "protocol.json"),
+                "evaluation": str(round_dir / "evaluation_unified.json"),
+                "result": str(round_dir / "result_unified.json"),
+                "hypothesis_tree": str(session_root / "state" / "hypothesis_tree.json"),
+                "task": str(session_root / "state" / "task.json"),
+            },
+        }
 
     def preflight(
         self,
@@ -1490,3 +1980,48 @@ class ResearchService:
                 "data": data,
             },
         )
+
+
+def _unit_for_target(target_label: str) -> str | None:
+    label = str(target_label or "").lower()
+    if "speed" in label:
+        return "km/s"
+    if "density" in label:
+        return "n/cm^3"
+    if "temperature" in label:
+        return "K"
+    if any(token in label for token in ("by", "bz", "bx", "scalar b", "imf", "磁场")):
+        return "nT"
+    return None
+
+
+def _protocol_feature_columns(protocol: dict[str, Any]) -> list[str]:
+    features = protocol.get("features") or {}
+    control = [str(item).strip() for item in features.get("control") or []]
+    treatment = [str(item).strip() for item in features.get("treatment") or []]
+    seen: set[str] = set()
+    columns: list[str] = []
+    for item in control + treatment:
+        if item and item not in seen:
+            seen.add(item)
+            columns.append(item)
+    return columns
+
+
+def _calendar_shift(value: Any, days: int) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        original = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    shifted = original + timedelta(days=int(days))
+    if (
+        original.hour == 0
+        and original.minute == 0
+        and original.second == 0
+        and original.microsecond == 0
+    ):
+        return shifted.date().isoformat()
+    return shifted.isoformat()

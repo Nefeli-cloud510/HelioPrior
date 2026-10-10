@@ -1949,7 +1949,9 @@ class LiveSessionManager:
 
 
 SESSION_MANAGER = LiveSessionManager()
-RESEARCH_V2_API = ResearchV2Api()
+RESEARCH_V2_API = ResearchV2Api(
+    legacy_session_root=REPO_ROOT / "runtime" / "live_session"
+)
 
 
 class LiveWorkflowHandler(BaseHTTPRequestHandler):

@@ -129,6 +129,43 @@ export async function uploadResearchArtifact(
   }
 }
 
+export interface ImportLegacyRoundPayload {
+  round_number?: number
+  experiment_id?: string
+  session_name?: string
+}
+
+export async function importLegacyRound(
+  researchId: string,
+  expectedRevision: number,
+  payload: ImportLegacyRoundPayload = {},
+): Promise<{
+  project: ResearchProjectDetail
+  preflight: PreflightResult
+  legacyImport: Record<string, unknown>
+}> {
+  const response = await v2Request<
+    ResearchProjectDetail & {
+      preflight: PreflightResult
+      legacy_import: Record<string, unknown>
+    }
+  >(`/research/${encodeURIComponent(researchId)}/import-legacy`, {
+    method: 'POST',
+    body: JSON.stringify({
+      expected_revision: expectedRevision,
+      ...payload,
+    }),
+  })
+  if (!response.data?.preflight || !response.data?.legacy_import) {
+    throw new ResearchApiError('legacy 导入后未返回证据预检结果。', 'missing_legacy_import', false)
+  }
+  return {
+    project: response.data,
+    preflight: response.data.preflight,
+    legacyImport: response.data.legacy_import,
+  }
+}
+
 export interface RunResearchPreflightPayload {
   artifact_id?: string
   feature_columns?: string[]

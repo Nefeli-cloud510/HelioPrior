@@ -25,6 +25,7 @@ class ResearchV2Api:
         data_source: Any | None = None,
         harness_project_root: Any | None = None,
         run_shap: bool = False,
+        legacy_session_root: Any | None = None,
     ) -> None:
         self.service = ResearchService(
             repository or ResearchRepository(),
@@ -32,6 +33,7 @@ class ResearchV2Api:
             data_source=data_source,
             harness_project_root=harness_project_root,
             run_shap=run_shap,
+            legacy_session_root=legacy_session_root,
         )
 
     def dispatch(
@@ -82,6 +84,15 @@ class ResearchV2Api:
                     return self._with_request_id(
                         request_id,
                         self.service.import_artifact(
+                            research_id=research_id,
+                            expected_revision=(payload or {}).get("expected_revision"),
+                            payload=payload or {},
+                        ),
+                    )
+                if operation == "import-legacy" and method == "POST":
+                    return self._with_request_id(
+                        request_id,
+                        self.service.import_legacy_round(
                             research_id=research_id,
                             expected_revision=(payload or {}).get("expected_revision"),
                             payload=payload or {},

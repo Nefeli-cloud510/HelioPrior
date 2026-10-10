@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { createResearchProject } from '../api/researchApi'
+import { createResearchProject, importLegacyRound } from '../api/researchApi'
 import { DataCoverageAudit } from '../components/DataCoverageAudit'
 import { ModelTuningCard } from '../components/ModelTuningCard'
 import { PageTabs } from '../components/PageTabs'
@@ -154,9 +154,14 @@ export function ExecutionPage() {
         },
         horizon_days: 3,
       })
+      await importLegacyRound(result.researchId, result.revision)
       navigate(`/research/${result.researchId}`)
     } catch (caught) {
-      setImportError(caught instanceof Error ? caught.message : '研究工作台项目创建失败。')
+      setImportError(
+        caught instanceof Error
+          ? caught.message
+          : '导入研究工作台失败：项目可能已创建，但 legacy 证据打包未完成。',
+      )
     } finally {
       setImporting(false)
     }

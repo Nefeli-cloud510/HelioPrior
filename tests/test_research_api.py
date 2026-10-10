@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -188,6 +189,72 @@ class ResearchV2ApiTest(unittest.TestCase):
         self.assertTrue(packet["packet_id"])
         self.assertAlmostEqual(packet["metrics"]["gain_rmse"]["value"], 0.1, places=6)
         self.assertEqual(preflighted.payload["data"]["evidence_packet_count"], 1)
+
+    def test_import_legacy_round_packages_predictions_and_runs_preflight(self) -> None:
+        legacy_root = Path(self.tmp.name) / "legacy_fixture"
+        round_dir = legacy_root / "results" / "round_01"
+        experiment_dir = round_dir / "E_T01" / "predictions"
+        experiment_dir.mkdir(parents=True)
+        state_dir = legacy_root / "state"
+        state_dir.mkdir(parents=True)
+        protocol = {
+            "experiment_id": "E_T01",
+            "round_id": 1,
+            "target": "BY, nT (GSE)",
+            "forecast_horizon_days": 2,
+            "features": {
+                "control": ["SW Plasma Speed, km/s"],
+                "treatment": ["SW Plasma Speed, km/s", "p2_y中心值"],
+            },
+        }
+        (round_dir / "protocol.json").write_text(
+            json.dumps(protocol, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (state_dir / "task.json").write_text(
+            json.dumps({"question": "日影能否为 By 提供增量预测"}),
+            encoding="utf-8",
+        )
+        (state_dir / "hypothesis_tree.json").write_text(
+            json.dumps({"hypotheses": ["H1", "H2"]}),
+            encoding="utf-8",
+        )
+        csv_text = """time,y_true,y_pred
+2024-01-03,-1.5,-1.3
+2024-01-04,2.0,2.2
+2024-01-05,-0.4,-0.5
+"""
+        (experiment_dir / "E_T01_baseline.csv").write_text(
+            csv_text,
+            encoding="utf-8",
+        )
+        (experiment_dir / "E_T01_treatment.csv").write_text(
+            csv_text,
+            encoding="utf-8",
+        )
+        api = ResearchV2Api(
+            self.api.service.repository,
+            legacy_session_root=legacy_root,
+        )
+        created = api.dispatch("POST", "/api/v2/research", create_payload())
+        research_id = created.payload["research_id"]
+        imported = api.dispatch(
+            "POST",
+            f"/api/v2/research/{research_id}/import-legacy",
+            {"expected_revision": created.payload["revision"]},
+        )
+        self.assertEqual(imported.status, 200)
+        payload = imported.payload["data"]
+        self.assertEqual(payload["legacy_import"]["session_name"], "legacy_fixture")
+        self.assertEqual(payload["legacy_import"]["round_number"], 1)
+        self.assertEqual(payload["legacy_import"]["experiment_id"], "E_T01")
+        self.assertEqual(len(payload["artifacts"]), 3)
+        self.assertEqual(payload["preflight"]["status"], "ready")
+        self.assertEqual(payload["evidence_packet_count"], 1)
+        self.assertGreater(
+            payload["preflight"]["packet"]["metrics"]["common_sample_count"]["value"],
+            0,
+        )
 
     def test_preflight_without_artifact_returns_actionable_error(self) -> None:
         created = self.api.dispatch("POST", "/api/v2/research", create_payload())

@@ -142,6 +142,14 @@ def parse_source_content(kind: str, content: str, file_name: str) -> ParsedSourc
         columns = sorted({key for row in rows for key in row})
         return ParsedSource(kind=kind, rows=rows, raw_columns=columns, parse_errors=errors)
 
+    if kind in {"protocol_json", "evidence_json", "report", "other"}:
+        return ParsedSource(
+            kind=kind,
+            rows=[],
+            raw_columns=sorted(str(key) for key in payload),
+            parse_errors=errors,
+        )
+
     imported_metrics = payload.get("metrics")
     if isinstance(imported_metrics, dict):
         errors.append("未提供逐行预测记录，指标按导入值登记，不重新计算。")
