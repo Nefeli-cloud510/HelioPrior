@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from core.decision_unified import (
     DecisionLayerService,
     UncertaintyPrioritizer,
     UtilityScorer,
+    _formal_risk_score,
 )
 from core.state_repository import UnifiedStateRepository
 from core.unified_schema import (
@@ -216,6 +218,107 @@ class DecisionLayerTest(unittest.TestCase):
         self.assertTrue((self.project_root / "state" / "candidate_experiments.json").exists())
         self.assertIsNotNone(plan.top_candidate())
         self.assertGreaterEqual(plan.top_candidate().utility_score, plan.candidates[-1].utility_score)
+
+    def test_candidate_designs_overlap_with_bounded_concurrency(self) -> None:
+        lock = threading.Lock()
+        overlapped = threading.Event()
+        active = 0
+        peak = 0
+        seen = []
+
+        class Designer:
+            def design(inner_self, *, candidate, **kwargs):
+                nonlocal active, peak
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                    seen.append(candidate.experiment_id)
+                    if active == 2:
+                        overlapped.set()
+                try:
+                    if not overlapped.wait(timeout=2):
+                        raise AssertionError("Independent candidate designs did not overlap")
+                    candidate.design.notes.append("parallel_design_completed")
+                finally:
+                    with lock:
+                        active -= 1
+                return True
+
+        plan = DecisionLayerService(
+            self.repository,
+            experiment_designer=Designer(),
+            experiment_writer=StubCandidateExperimentWriter(),
+            candidate_design_workers=2,
+        ).build_candidate_plan(task=self.task, data_dictionary=self.dictionary)
+        self.assertEqual(peak, 2)
+        self.assertCountEqual(seen, [c.experiment_id for c in plan.candidates])
+        self.assertTrue(all("parallel_design_completed" in c.design.notes for c in plan.candidates))
+
+    def test_serial_and_parallel_plans_have_same_results(self) -> None:
+        results = []
+        for workers in (1, 2):
+            plan = DecisionLayerService(
+                self.repository,
+                experiment_designer=StubCandidateExperimentDesigner(),
+                experiment_writer=StubCandidateExperimentWriter(),
+                candidate_design_workers=workers,
+            ).build_candidate_plan(task=self.task, data_dictionary=self.dictionary)
+            results.append([candidate.model_dump(mode="json") for candidate in plan.candidates])
+        self.assertEqual(results[0], results[1])
+
+    def test_writer_receives_scores_for_final_design(self) -> None:
+        case = self
+        checked = []
+        tree = self.repository.load_hypothesis_tree()
+        memory = self.repository.load_experiment_memory()
+
+        class Designer:
+            def design(inner_self, *, candidate, **kwargs):
+                # More lags change the program's design-complexity risk estimate.
+                candidate.design.lags = {"DeltaDec": [0, 1], "By": [0, 1], "Bz": [0, 1]}
+                return True
+
+        class Writer(StubCandidateExperimentWriter):
+            def write_all(inner_self, candidates, **kwargs):
+                for candidate in candidates:
+                    expected_risk, _ = _formal_risk_score(
+                        candidate=candidate,
+                        task=case.task,
+                        data_dictionary=case.dictionary,
+                        hypothesis_tree=tree,
+                        experiment_memory=memory,
+                    )
+                    case.assertAlmostEqual(candidate.estimated_risk.value, expected_risk)
+                    case.assertIsNotNone(candidate.utility_score)
+                    checked.append(candidate.experiment_id)
+                super().write_all(candidates, **kwargs)
+
+        plan = DecisionLayerService(
+            self.repository,
+            experiment_designer=Designer(),
+            experiment_writer=Writer(),
+            candidate_design_workers=2,
+        ).build_candidate_plan(task=self.task, data_dictionary=self.dictionary)
+        self.assertEqual(len(checked), len(plan.candidates))
+
+    def test_failed_design_batch_does_not_save_partial_candidates(self) -> None:
+        path = self.project_root / "state" / "candidate_experiments.json"
+        before = path.read_bytes() if path.exists() else None
+
+        class Designer:
+            def design(inner_self, *, candidate, **kwargs):
+                candidate.design.notes.append("must_not_be_persisted")
+                raise RuntimeError("controlled worker failure")
+
+        service = DecisionLayerService(
+            self.repository,
+            experiment_designer=Designer(),
+            experiment_writer=StubCandidateExperimentWriter(),
+            candidate_design_workers=2,
+        )
+        with self.assertRaisesRegex(RuntimeError, "controlled worker failure"):
+            service.build_candidate_plan(task=self.task, data_dictionary=self.dictionary)
+        self.assertEqual(path.read_bytes() if path.exists() else None, before)
 
     def test_generated_hypothesis_rationale_flows_into_candidate_design(self) -> None:
         repository = UnifiedStateRepository(self.project_root / "generated")

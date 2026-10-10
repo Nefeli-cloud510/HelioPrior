@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -598,6 +599,7 @@ class DecisionLayerService:
         scorer: UtilityScorer | None = None,
         experiment_designer: CandidateExperimentDesignerLLM | None = None,
         experiment_writer: CandidateExperimentWriterLLM | None = None,
+        candidate_design_workers: int | None = None,
     ) -> None:
         self.repository = repository
         self.prioritizer = prioritizer or UncertaintyPrioritizer()
@@ -605,6 +607,15 @@ class DecisionLayerService:
         self.scorer = scorer or UtilityScorer()
         self.experiment_designer = experiment_designer or CandidateExperimentDesignerLLM()
         self.experiment_writer = experiment_writer or CandidateExperimentWriterLLM()
+        configured_workers = (
+            candidate_design_workers
+            if candidate_design_workers is not None
+            else get_runtime_setting("HELIOPRIOR_CANDIDATE_DESIGN_WORKERS", "2")
+        )
+        try:
+            self.candidate_design_workers = min(4, max(1, int(configured_workers)))
+        except (TypeError, ValueError):
+            self.candidate_design_workers = 2
 
     def build_candidate_plan(
         self,
@@ -661,7 +672,10 @@ class DecisionLayerService:
             if data_dictionary.feature_candidates
             else task.payload.research_question.target
         )
-        for candidate in candidates.candidates:
+
+        def design_candidate(original: CandidateExperiment) -> CandidateExperiment:
+            # Workers own their candidate; repository writes remain on this thread.
+            candidate = original.model_copy(deep=True)
             record = (
                 uncertainty_index.get(candidate.related_uncertainties[0])
                 if candidate.related_uncertainties
@@ -679,15 +693,38 @@ class DecisionLayerService:
                 primary_x=primary_x,
                 round_id=resolved_round or candidates.round,
             )
+            return candidate
+
+        if self.candidate_design_workers == 1 or len(candidates.candidates) < 2:
+            designed = [design_candidate(candidate) for candidate in candidates.candidates]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(self.candidate_design_workers, len(candidates.candidates))
+            ) as pool:
+                # map preserves candidate order; merge only after all workers succeed.
+                designed = list(pool.map(design_candidate, candidates.candidates))
+        candidates.candidates = designed
+        for candidate in candidates.candidates:
+            _validate_candidate_design(candidate)
+            _apply_semantic_to_candidate_display(candidate, semantic_service, node_index)
+            # The LLM may have changed the arms/focus after the draft was valued.
+            _annotate_candidate_estimates(
+                candidate=candidate,
+                task=task,
+                data_dictionary=data_dictionary,
+                hypothesis_tree=tree,
+                experiment_memory=experiment_memory,
+                current_round=resolved_round or candidates.round,
+            )
+        scored = self.scorer.score(candidates, experiment_memory=experiment_memory)
         self.experiment_writer.write_all(
-            candidates=candidates.candidates,
+            candidates=scored.candidates,
             task=task,
             semantic_service=semantic_service,
             node_index=node_index,
             round_id=resolved_round or candidates.round,
             uncertainty_index=uncertainty_index,
         )
-        scored = self.scorer.score(candidates, experiment_memory=experiment_memory)
         uncertainty_index = uncertainties.record_index()
         for candidate in scored.candidates:
             for uncertainty_id in candidate.related_uncertainties:
