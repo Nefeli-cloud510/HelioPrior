@@ -9,6 +9,13 @@
 - `scripts/`：实时工作流服务与修复脚本。
 - `frontend/`：React + TypeScript + Vite 前端。
 - `runtime/live_session/current/`：会话状态、上传数据、实验结果与审计记录。
+- `runtime/research/`：research_review 模式的项目隔离存储，按项目与修订版本组织。
+
+## research_review 模式
+
+项目同时保留原有 legacy 科研闭环与新的 research_review 科研复核工作流。后者面向“结论与证据导入、同证据包双路独立复核、分歧到可执行验证的映射、结论版本与人工决定”的闭环，真实案例为 LHAASO 日影对未来 IMF By 的增量预测；假设树继续作为竞争解释与区分性实验工具。
+
+默认目标为 `imf_by_gse / by_gse / nT / GSE`，提前量默认 3 天。前端入口为 `/research`，后端接口挂载在 `/api/v2/research`。项目隔离、接口清单、离线 stub、测试记录与 5 分钟验收演示见 [docs/RESEARCH_REVIEW_DEMO.md](docs/RESEARCH_REVIEW_DEMO.md)。
 
 ## 本地开发
 
