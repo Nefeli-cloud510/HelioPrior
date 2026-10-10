@@ -4,6 +4,7 @@ import hashlib
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from core.evidence_builder import (
@@ -34,6 +35,10 @@ from core.research_schema import (
     ResearchProject,
     ResearchRevision,
     ResearchTarget,
+)
+from core.research_validation import (
+    ResearchValidationError,
+    ValidationPlanner,
 )
 
 
@@ -69,9 +74,22 @@ class ResearchService:
         repository: ResearchRepository,
         *,
         gateway: Any | None = None,
+        data_source: Any | None = None,
+        harness_project_root: Path | None = None,
+        run_shap: bool = False,
     ) -> None:
         self.repository = repository
         self.gateway = gateway
+        self.data_source = data_source
+        self.harness_project_root = harness_project_root
+        self.run_shap = run_shap
+        self.validation_planner = ValidationPlanner(
+            repository,
+            gateway=gateway,
+            data_source=data_source,
+            harness_project_root=harness_project_root,
+            run_shap=run_shap,
+        )
 
     def _orchestrator(self) -> ReviewOrchestrator:
         return ReviewOrchestrator(gateway=self.gateway)
@@ -682,6 +700,127 @@ class ResearchService:
             },
         )
 
+    def plan_validations(
+        self,
+        research_id: str,
+        expected_revision: int,
+        payload: dict[str, Any],
+    ) -> ApiResult:
+        result = self.validation_planner.plan_batch(
+            research_id=research_id,
+            expected_revision=expected_revision,
+            payload=payload,
+        )
+        return self._validation_plan_response(
+            result.revision,
+            batch_id=result.batch_id,
+            is_stub=result.is_stub,
+            candidate_ids=result.candidate_ids,
+            message=result.message,
+        )
+
+    def approve_protocol(
+        self,
+        research_id: str,
+        expected_revision: int,
+        payload: dict[str, Any],
+    ) -> ApiResult:
+        revision = self.validation_planner.approve(
+            research_id=research_id,
+            expected_revision=expected_revision,
+            payload=payload,
+        )
+        candidate = self._find_candidate(revision, payload)
+        decision = (
+            revision.decisions[-1]
+            if revision.decisions
+            and revision.decisions[-1].action == "approve_protocol"
+            else None
+        )
+        result = self._project_response(revision, created=False)
+        result.payload["data"]["approval"] = {
+            "candidate_id": candidate.experiment_id if candidate else None,
+            "protocol_hash": payload.get("protocol_hash"),
+            "status": candidate.status if candidate else None,
+            "decision": decision.model_dump(exclude_none=True) if decision else None,
+        }
+        return result
+
+    def execute_protocol(
+        self,
+        research_id: str,
+        expected_revision: int,
+        payload: dict[str, Any],
+    ) -> ApiResult:
+        revision = self.validation_planner.execute(
+            research_id=research_id,
+            expected_revision=expected_revision,
+            payload=payload,
+        )
+        candidate = self._find_candidate(revision, payload)
+        jobs = [
+            job
+            for job in revision.jobs
+            if job.kind == "validation_execution"
+            and (candidate is None or job.review_id in candidate.dispute_ids)
+        ]
+        result = self._project_response(revision, created=False)
+        result.payload["data"]["execution"] = {
+            "candidate_id": candidate.experiment_id if candidate else None,
+            "protocol_hash": payload.get("protocol_hash"),
+            "status": candidate.status if candidate else None,
+            "job": jobs[-1].model_dump(exclude_none=True) if jobs else None,
+        }
+        return result
+
+    @staticmethod
+    def _find_candidate(
+        revision: ResearchRevision,
+        payload: dict[str, Any],
+    ) -> Any | None:
+        protocol_hash_value = str(payload.get("protocol_hash") or "").strip()
+        candidate_id = str(payload.get("candidate_id") or "").strip()
+        for candidate in revision.candidates:
+            if candidate.protocol_hash != protocol_hash_value:
+                continue
+            if candidate_id and candidate.experiment_id != candidate_id:
+                continue
+            return candidate
+        return None
+
+    def _validation_plan_response(
+        self,
+        revision: ResearchRevision,
+        *,
+        batch_id: str,
+        is_stub: bool,
+        candidate_ids: list[str],
+        message: str,
+    ) -> ApiResult:
+        result = self._project_response(revision, created=False)
+        selected = [
+            candidate
+            for candidate in revision.candidates
+            if candidate.experiment_id in set(candidate_ids)
+        ]
+        selected_hashes = {candidate.protocol_hash for candidate in selected}
+        result.payload["data"]["validation_plan"] = {
+            "batch_id": batch_id,
+            "is_stub": is_stub,
+            "candidate_ids": candidate_ids,
+            "message": message,
+            "candidates": [
+                candidate.model_dump(exclude_none=True)
+                for candidate in selected
+            ],
+            "protocols": [
+                protocol.model_dump(exclude_none=True)
+                for protocol in revision.protocols
+                if protocol.protocol_hash in selected_hashes
+            ],
+        }
+        return result
+
     def _require_revision(self, current_revision: int, expected_revision: Any) -> None:
         try:
             expected = int(expected_revision)
@@ -865,6 +1004,10 @@ class ResearchService:
         project = revision.project
         claims = [claim.model_dump(exclude_none=True) for claim in revision.claims]
         artifacts = [artifact.model_dump(exclude_none=True) for artifact in revision.artifacts]
+        protocols = [
+            protocol.model_dump(exclude_none=True)
+            for protocol in revision.protocols
+        ]
         evidence_packets = [
             packet.model_dump(exclude_none=True)
             for packet in revision.evidence_packets
@@ -903,6 +1046,15 @@ class ResearchService:
             "revision": revision.revision,
             "claims": claims,
             "artifacts": artifacts,
+            "protocols": protocols,
+            "candidates": [
+                candidate.model_dump(exclude_none=True)
+                for candidate in revision.candidates
+            ],
+            "decisions": [
+                decision.model_dump(exclude_none=True)
+                for decision in revision.decisions
+            ],
             "evidence_packets": evidence_packets,
             "checks": checks,
             "metrics": metrics,

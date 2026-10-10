@@ -117,9 +117,14 @@ class FakeGateway(LLMGateway):
     def generate_structured(self, *, system_prompt, user_prompt, response_model, fallback_factory=None, payload_fixer=None, temperature=None, image_paths=None):
         self._track_enter()
         try:
-            role = "central_arbitrator" if "中央协调者" in system_prompt else (
-                "scientific_questioner" if "科学质询者" in system_prompt else "scientific_interpreter"
-            )
+            if "实验规划者" in system_prompt:
+                role = "experiment_planner"
+            elif "中央协调者" in system_prompt:
+                role = "central_arbitrator"
+            elif "科学质询者" in system_prompt:
+                role = "scientific_questioner"
+            else:
+                role = "scientific_interpreter"
             key = role
             with self._lock:
                 self.calls.append((role, user_prompt, system_prompt))

@@ -44,7 +44,9 @@ class ScriptedReviewGateway(LLMGateway):
         self.calls: list[str] = []
 
     def generate_structured(self, *, system_prompt, user_prompt, response_model, fallback_factory=None, payload_fixer=None, temperature=None, image_paths=None):
-        if "中央协调者" in system_prompt:
+        if "实验规划者" in system_prompt:
+            role = "experiment_planner"
+        elif "中央协调者" in system_prompt:
             role = "central_arbitrator"
         elif "科学质询者" in system_prompt:
             role = "scientific_questioner"
@@ -143,7 +145,7 @@ class ResearchV2ApiTest(unittest.TestCase):
     def test_later_endpoints_return_explicit_not_implemented(self) -> None:
         created = self.api.dispatch("POST", "/api/v2/research", create_payload())
         research_id = created.payload["research_id"]
-        response = self.api.dispatch("POST", f"/api/v2/research/{research_id}/plans", {"expected_revision": 1})
+        response = self.api.dispatch("POST", f"/api/v2/research/{research_id}/report", {"expected_revision": 1})
         self.assertEqual(response.status, 501)
         self.assertEqual(response.payload["code"], "not_implemented")
 

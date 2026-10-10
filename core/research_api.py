@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from core.research_repository import ResearchRepository, ResearchVersionConflictError
 from core.review_orchestrator import ResearchReviewError
 from core.research_service import ApiResult, ResearchApiError, ResearchService
+from core.research_validation import ResearchValidationError
 
 
 RESEARCH_BASE = "/api/v2/research"
@@ -21,10 +22,16 @@ class ResearchV2Api:
         repository: ResearchRepository | None = None,
         *,
         gateway: Any | None = None,
+        data_source: Any | None = None,
+        harness_project_root: Any | None = None,
+        run_shap: bool = False,
     ) -> None:
         self.service = ResearchService(
             repository or ResearchRepository(),
             gateway=gateway,
+            data_source=data_source,
+            harness_project_root=harness_project_root,
+            run_shap=run_shap,
         )
 
     def dispatch(
@@ -103,13 +110,37 @@ class ResearchV2Api:
                         request_id,
                         self.service.list_disputes(research_id),
                     )
+                if operation == "plans" and method == "POST":
+                    return self._with_request_id(
+                        request_id,
+                        self.service.plan_validations(
+                            research_id=research_id,
+                            expected_revision=(payload or {}).get("expected_revision"),
+                            payload=payload or {},
+                        ),
+                    )
+                if operation == "approvals" and method == "POST":
+                    return self._with_request_id(
+                        request_id,
+                        self.service.approve_protocol(
+                            research_id=research_id,
+                            expected_revision=(payload or {}).get("expected_revision"),
+                            payload=payload or {},
+                        ),
+                    )
+                if operation == "executions" and method == "POST":
+                    return self._with_request_id(
+                        request_id,
+                        self.service.execute_protocol(
+                            research_id=research_id,
+                            expected_revision=(payload or {}).get("expected_revision"),
+                            payload=payload or {},
+                        ),
+                    )
                 if operation in {
                     "artifacts",
                     "preflight",
                     "hypotheses",
-                    "plans",
-                    "approvals",
-                    "executions",
                     "evidence",
                     "decisions",
                     "claims",
@@ -132,6 +163,15 @@ class ResearchV2Api:
                 status=exc.status,
                 code=exc.code,
                 retryable=exc.status >= 500,
+                details=exc.details,
+            )
+            return self._error_response(request_id, error)
+        except ResearchValidationError as exc:
+            error = ResearchApiError(
+                exc.message,
+                status=exc.status,
+                code=exc.code,
+                retryable=exc.retryable,
                 details=exc.details,
             )
             return self._error_response(request_id, error)

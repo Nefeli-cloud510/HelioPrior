@@ -216,11 +216,16 @@ class ValidationCandidate(ResearchBaseModel):
     dispute_ids: list[str] = Field(default_factory=list)
     hypothesis_ids: list[str] = Field(default_factory=list)
     template_id: str = Field(min_length=1)
+    round_id: int = Field(default=1, ge=1)
     design: dict[str, Any] = Field(default_factory=dict)
     estimates: list[ValidationEstimate] = Field(default_factory=list)
     approval_required: bool = True
     status: Literal["draft", "pending_approval", "approved", "executed", "failed", "superseded"] = "draft"
     protocol_hash: str | None = None
+    utility_score: float | None = Field(default=None, ge=-1.0, le=1.0)
+    source: Literal["program", "llm"] = "program"
+    is_stub: bool = False
+    rationale: str | None = None
 
 
 class ResearchDecision(ResearchBaseModel):
