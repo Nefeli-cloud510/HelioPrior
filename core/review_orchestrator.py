@@ -464,6 +464,46 @@ def make_disputes(
             updated_at=now,
         )
         disputes.append(dispute)
+
+    unresolved_checks = [
+        check
+        for check in packet.checks
+        if check.status in {"unknown", "fail"}
+    ]
+    if (
+        not disputes
+        and bool(questioner.is_stub)
+        and bool(interpreter.is_stub)
+        and questioner.stance == "unknown"
+        and interpreter.stance == "unknown"
+        and unresolved_checks
+    ):
+        unresolved_codes = "; ".join(check.code for check in unresolved_checks[:5])
+        disputes.append(
+            Dispute(
+                dispute_id=f"DSP_{review_id[-14:]}_1",
+                review_id=review_id,
+                claim_id=claim_id,
+                question=(
+                    "两路离线占位意见均不能形成科学判断，且程序检查仍有未通过的项"
+                    f"（{unresolved_codes}）；需要先执行可验证的补充实验。"
+                ),
+                issue_code="PROGRAM_VERIFICATION_REQUIRED",
+                scope={
+                    "packet_id": packet.packet_id,
+                    "packet_hash": packet.packet_hash,
+                    "consequence": "程序检查结果保持未通过，不能自动进入待决定状态。",
+                },
+                opinion_ids=[
+                    questioner.opinion_id,
+                    interpreter.opinion_id,
+                ],
+                evidence_ids=[packet.packet_id],
+                status="open",
+                created_at=now,
+                updated_at=now,
+            )
+        )
     return disputes
 
 

@@ -104,6 +104,13 @@ def _to_float(value: Any) -> float | None:
 def parse_source_content(kind: str, content: str, file_name: str) -> ParsedSource:
     kind = str(kind or "prediction_csv").lower()
     errors: list[str] = []
+    if file_name.lower().endswith(".pdf"):
+        return ParsedSource(
+            kind="report",
+            rows=[],
+            raw_columns=[],
+            parse_errors=["PDF 报告按原始文件登记，不参与表格解析与数值预检。"],
+        )
     if kind == "prediction_csv" or file_name.lower().endswith(".csv"):
         kind = "prediction_csv"
         try:
@@ -254,7 +261,8 @@ def _resolve_arms(parsed: ParsedPredictions, *, base_arm: str | None, aug_arm: s
         if not base_arm or not aug_arm:
             return "指定组别时须同时提供 base_arm 与 aug_arm。"
         if base_arm not in arm_values or aug_arm not in arm_values:
-            return "指定的 base_arm 或 aug_arm 不在预测文件中。"
+            available = "、".join(arm_values) if arm_values else "无可用组别"
+            return f"指定的 base_arm 或 aug_arm 不在预测文件中。可用组别：{available}"
         return (str(base_arm), str(aug_arm))
     if len(arm_values) > 2:
         return "预测文件包含超过两个方案组，须明确指定 base_arm 与 aug_arm。"

@@ -1,3 +1,4 @@
+import { Link } from 'react-router-dom'
 import { useTabs } from '../contexts/TabContext'
 import { WorkspaceRoundChip } from './WorkspaceRoundChip'
 
@@ -34,6 +35,9 @@ export function PageTabs() {
           )}
         </div>
       ))}
+      <Link className="page-tabs__workbench" to="/research">
+        研究工作台
+      </Link>
     </div>
   )
 }

@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import csv
+import hashlib
+import io
 import json
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from core.calendar_samples import build_sample_plan
+from core.evidence_builder import (
+    build_evidence_packet,
+    normalize_prediction_rows,
+    parse_source_content,
+)
 from core.llm_gateway import LLMGateway
 from core.method_registry import METHOD_REGISTRY
 from core.protocol_bridge import (
@@ -19,8 +28,11 @@ from core.protocol_bridge import (
 from core.protocol_hash import PROTOCOL_VERSION, protocol_hash
 from core.research_repository import ResearchRepository
 from core.research_schema import (
+    SCHEMA_VERSION,
     AgentCallRecord,
+    ArtifactRecord,
     Dispute,
+    EvidencePacket,
     JobRecord,
     ResearchTarget,
     ProtocolSnapshot,
@@ -1058,6 +1070,38 @@ class ValidationPlanner:
                 retryable=True,
             ) from exc
 
+        new_artifacts: list[ArtifactRecord] = []
+        evidence_packet: EvidencePacket | None = None
+        if candidate.template_id != "calendar_alignment":
+            try:
+                new_artifacts, evidence_packet = self._build_execution_evidence(
+                    research_id,
+                    protocol=protocol,
+                    candidate=candidate,
+                    protocol_hash_value=protocol_hash_value,
+                    result_payload=result_payload,
+                    current=current,
+                )
+            except ResearchValidationError:
+                raise
+            except Exception as exc:
+                raise ResearchValidationError(
+                    f"执行证据回写失败：{exc}",
+                    status=422,
+                    code="evidence_writeback_failed",
+                    retryable=True,
+                ) from exc
+
+        result_ref = (
+            f"{protocol_hash_value[:16]}:{candidate.experiment_id}:"
+            f"{result_payload.get('status')}"
+        )
+        if evidence_packet is not None:
+            result_ref = (
+                f"{protocol_hash_value[:16]}:{candidate.experiment_id}:"
+                f"evidence_packet:{evidence_packet.packet_id}"
+            )
+
         job = JobRecord(
             job_id="JOB_" + uuid.uuid4().hex[:12].upper(),
             kind="validation_execution",
@@ -1100,6 +1144,19 @@ class ValidationPlanner:
                         if estimate.component != "EXECUTION"
                     ]
                     item.estimates = [*preserved, execution_marker]
+            state.artifacts.extend(new_artifacts)
+            existing_packet_ids = {packet.packet_id for packet in state.evidence_packets}
+            if (
+                evidence_packet is not None
+                and evidence_packet.packet_id not in existing_packet_ids
+            ):
+                state.evidence_packets.append(evidence_packet)
+                for claim in state.claims:
+                    if (
+                        claim.claim_id in evidence_packet.claim_ids
+                        and evidence_packet.packet_id not in claim.evidence_ids
+                    ):
+                        claim.evidence_ids.append(evidence_packet.packet_id)
             state.jobs.append(job)
             state.decisions.append(decision)
             state.agent_calls.append(
@@ -1126,6 +1183,175 @@ class ValidationPlanner:
             research_id,
             expected_revision=current.revision,
             mutation=apply_execution,
+        )
+
+    @staticmethod
+    def _combine_arm_predictions(
+        baseline_path: Path,
+        treatment_path: Path,
+        *,
+        base_arm: str,
+        aug_arm: str,
+    ) -> str:
+        fieldnames: list[str] = []
+        rows: list[dict[str, Any]] = []
+        sources = ((baseline_path, base_arm), (treatment_path, aug_arm))
+        for path, arm in sources:
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                for name in list(reader.fieldnames or []):
+                    if name not in fieldnames:
+                        fieldnames.append(name)
+                for raw in reader:
+                    row = {name: raw.get(name) for name in fieldnames}
+                    row["arm"] = arm
+                    rows.append(row)
+        if "arm" not in fieldnames:
+            fieldnames.append("arm")
+        output = io.StringIO()
+        writer = csv.DictWriter(
+            output,
+            fieldnames=fieldnames,
+            extrasaction="ignore",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+        return output.getvalue()
+
+    def _make_execution_artifact(
+        self,
+        research_id: str,
+        *,
+        file_name: str,
+        kind: str,
+        content: str,
+    ) -> ArtifactRecord:
+        artifact_id = "ART_" + uuid.uuid4().hex[:12].upper()
+        stored_path = self.repository.store_artifact(
+            research_id,
+            artifact_id,
+            content,
+        )
+        parsed_source = parse_source_content(kind, content, file_name)
+        now = datetime.now()
+        return ArtifactRecord(
+            artifact_id=artifact_id,
+            file_name=file_name,
+            sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            size_bytes=len(content.encode("utf-8")),
+            kind=kind,
+            stored_path=str(stored_path),
+            parsed=not bool(parsed_source.parse_errors),
+            parse_errors=list(parsed_source.parse_errors),
+            created_at=now,
+            updated_at=now,
+            source_kind="validation_execution",
+            schema_version=SCHEMA_VERSION,
+        )
+
+    def _build_execution_evidence(
+        self,
+        research_id: str,
+        *,
+        protocol: ExperimentProtocol,
+        candidate: ValidationCandidate,
+        protocol_hash_value: str,
+        result_payload: dict[str, Any],
+        current: ResearchRevision,
+    ) -> tuple[list[ArtifactRecord], EvidencePacket | None]:
+        if candidate.template_id == "calendar_alignment":
+            return [], None
+        if self.harness_project_root is None or self.data_source is None:
+            raise ResearchValidationError(
+                "执行证据回写需要 harness 项目目录与数据源配置。",
+                status=422,
+                code="evidence_writeback_config_missing",
+                retryable=True,
+            )
+
+        predictions_dir = (
+            self.harness_project_root
+            / "results"
+            / f"round_{protocol.round_id:02d}"
+            / candidate.experiment_id
+            / "predictions"
+        )
+        baseline_path = predictions_dir / f"{candidate.experiment_id}_baseline.csv"
+        treatment_path = predictions_dir / f"{candidate.experiment_id}_treatment.csv"
+        if not baseline_path.is_file() or not treatment_path.is_file():
+            raise ResearchValidationError(
+                "执行证据回写失败：两组预测 CSV 不存在，无法登记为证据包。",
+                status=422,
+                code="evidence_predictions_missing",
+                retryable=True,
+            )
+
+        prediction_csv = self._combine_arm_predictions(
+            baseline_path,
+            treatment_path,
+            base_arm="baseline",
+            aug_arm="treatment",
+        )
+        prediction_artifact = self._make_execution_artifact(
+            research_id,
+            file_name=f"{candidate.experiment_id}_paired_predictions.csv",
+            kind="prediction_csv",
+            content=prediction_csv,
+        )
+        protocol_artifact = self._make_execution_artifact(
+            research_id,
+            file_name=f"{candidate.experiment_id}_protocol.json",
+            kind="protocol_json",
+            content=json.dumps(
+                protocol.model_dump(mode="json", exclude_none=True),
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+        evidence_artifact = self._make_execution_artifact(
+            research_id,
+            file_name=f"{candidate.experiment_id}_result_unified.json",
+            kind="evidence_json",
+            content=json.dumps(
+                result_payload,
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+        parsed_source = parse_source_content(
+            "prediction_csv",
+            prediction_csv,
+            prediction_artifact.file_name,
+        )
+        parsed = normalize_prediction_rows(parsed_source)
+        if not parsed.rows:
+            raise ResearchValidationError(
+                "执行证据回写失败：合并后的预测文件没有可解析记录。",
+                status=422,
+                code="evidence_rows_empty",
+                retryable=True,
+            )
+
+        claim_ids = [claim.claim_id for claim in current.claims]
+        packet = build_evidence_packet(
+            parsed=parsed,
+            protocol_hash_value=protocol_hash_value,
+            data_manifest_hash=result_payload.get("protocol_hash"),
+            run_id=f"{candidate.experiment_id}:{protocol_hash_value[:12]}",
+            claim_ids=claim_ids,
+            target_id=current.project.target.id or protocol.target,
+            unit=current.project.target.unit,
+            horizon_days=protocol.forecast_horizon_days,
+            feature_columns=list(protocol.features.treatment),
+            base_arm="baseline",
+            aug_arm="treatment",
+            primary_artifact_id=prediction_artifact.artifact_id,
+            primary_artifact_sha256=prediction_artifact.sha256,
+        )
+        return (
+            [prediction_artifact, protocol_artifact, evidence_artifact],
+            packet,
         )
 
     def _record_failure(

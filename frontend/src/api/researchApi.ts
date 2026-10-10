@@ -103,6 +103,7 @@ export interface UploadResearchArtifactPayload {
   kind: ArtifactKind
   content: string
   content_type?: string
+  content_encoding?: 'base64'
 }
 
 export async function uploadResearchArtifact(

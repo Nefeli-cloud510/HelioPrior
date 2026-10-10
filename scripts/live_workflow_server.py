@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import mimetypes
+import os
 import re
 import shutil
 import sys
@@ -28,6 +29,7 @@ from core.display_text_cleaner import clean_repository_text
 from core.llm_gateway import LLMGateway
 from core.method_registry import METHOD_REGISTRY
 from core.multi_source_uncertainty_miner import MIN_UNCERTAINTIES
+from core.protocol_bridge import ElasticNetDataSourceConfig
 from core.research_api import ResearchV2Api
 from core.runtime_config import get_default_llm_model, get_llm_role_models, load_project_env
 from core.state_repository import UnifiedStateRepository
@@ -58,6 +60,10 @@ UPLOAD_MANIFEST_PATH = STATE_DIR / "upload_manifest.json"
 MODEL_USAGE_PATH = STATE_DIR / "model_usage.json"
 STAGED_DATA_DIR = REPO_ROOT / "runtime" / "live_session" / "staged"
 STAGED_MANIFEST_PATH = STAGED_DATA_DIR / "staged_manifest.json"
+RESEARCH_V2_DATA_ROOT = (
+    REPO_ROOT / "runtime" / "live_session" / "vsw_backup_20261009" / "data" / "raw"
+)
+RESEARCH_V2_RUNTIME_ROOT = REPO_ROOT / "runtime" / "research_v2"
 
 PRIORITY_SCORE_BY_LEVEL = {"low": 0.4, "medium": 0.6, "high": 0.85}
 
@@ -1949,8 +1955,39 @@ class LiveSessionManager:
 
 
 SESSION_MANAGER = LiveSessionManager()
+def _build_research_v2_data_source() -> ElasticNetDataSourceConfig:
+    return ElasticNetDataSourceConfig(
+        omni_file_path=RESEARCH_V2_DATA_ROOT / "out_of_ICME_raw_OMNI_Daily_DATA_1_.xlsx",
+        lhaaso_file_path=RESEARCH_V2_DATA_ROOT / "raw_out_of_ICME_sunshadow2.xlsx",
+        extra_file_paths=[RESEARCH_V2_DATA_ROOT / "PFSS_data.xlsx"],
+        time_column="TIME",
+        target_column="SW Plasma Speed, km/s",
+        column_aliases={
+            "By": "BY, nT (GSE)",
+            "Bz": "BZ, nT (GSE)",
+            "DeltaDec": "p2_y中心值",
+        },
+    )
+
+
+class _OfflineLLMClient:
+    """Forces the gateway's offline fallback without touching the network."""
+
+    chat: Any = None
+
+
+def _research_gateway() -> LLMGateway | None:
+    offline = str(os.environ.get("HELIOPRIOR_OFFLINE", "")).strip().lower()
+    if offline in {"1", "true", "yes", "on"}:
+        return LLMGateway(client=_OfflineLLMClient(), allow_fallback=True)
+    return None
+
+
 RESEARCH_V2_API = ResearchV2Api(
-    legacy_session_root=REPO_ROOT / "runtime" / "live_session"
+    legacy_session_root=REPO_ROOT / "runtime" / "live_session",
+    data_source=_build_research_v2_data_source(),
+    harness_project_root=RESEARCH_V2_RUNTIME_ROOT,
+    gateway=_research_gateway(),
 )
 
 

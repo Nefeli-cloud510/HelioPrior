@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import csv
 import hashlib
 import io
@@ -203,18 +204,39 @@ class ResearchService:
             raise ResearchApiError("file_name 不能为空。", status=422, code="missing_required_field")
         if content is None:
             raise ResearchApiError("content 不能为空。", status=422, code="missing_required_field")
-        if isinstance(content, str):
-            if len(content) > 20_000_000:
+        content_encoding = str(payload.get("content_encoding") or "").strip().lower()
+        if content_encoding == "base64":
+            if not isinstance(content, str):
                 raise ResearchApiError(
-                    "导入产物过大，单文件上限为 20MB。",
+                    "base64 编码的 content 必须为字符串。",
                     status=422,
-                    code="artifact_too_large",
+                    code="invalid_artifact_content",
                 )
-        elif not isinstance(content, (bytes, bytearray)):
+            try:
+                content = base64.b64decode(content, validate=True)
+            except Exception as exc:
+                raise ResearchApiError(
+                    f"content 不是有效的 base64：{exc}",
+                    status=422,
+                    code="invalid_artifact_content",
+                )
+        elif content_encoding:
+            raise ResearchApiError(
+                f"暂不支持 content_encoding={content_encoding}。",
+                status=422,
+                code="invalid_artifact_content",
+            )
+        if not isinstance(content, (str, bytes, bytearray)):
             raise ResearchApiError(
                 "content 必须是字符串或字节。",
                 status=422,
                 code="invalid_artifact_content",
+            )
+        if len(content) > 20_000_000:
+            raise ResearchApiError(
+                "导入产物过大，单文件上限为 20MB。",
+                status=422,
+                code="artifact_too_large",
             )
 
         kind = str(payload.get("kind") or "prediction_csv").lower()
@@ -226,17 +248,27 @@ class ResearchService:
                 code="invalid_artifact_kind",
             )
 
-        text_content = content.decode("utf-8", errors="replace") if isinstance(content, (bytes, bytearray)) else content
-        parsed_source = parse_source_content(kind, text_content, file_name)
-        parsed = normalize_prediction_rows(parsed_source)
         artifact_id = "ART_" + uuid.uuid4().hex[:12].upper()
-        stored_path = self.repository.store_artifact(research_id, artifact_id, text_content)
+        file_suffix = Path(file_name).suffix.lower()
+        binary_document = kind == "report" and file_suffix in {".pdf", ".docx", ".doc"}
+        if binary_document:
+            raw_content = bytes(content) if isinstance(content, (bytes, bytearray)) else content.encode("utf-8")
+            text_content = raw_content.decode("utf-8", errors="replace")
+            parsed_source = parse_source_content(kind, text_content, file_name)
+            stored_path = self.repository.store_artifact(research_id, artifact_id, raw_content)
+            digest_bytes = raw_content
+        else:
+            text_content = content.decode("utf-8", errors="replace") if isinstance(content, (bytes, bytearray)) else content
+            parsed_source = parse_source_content(kind, text_content, file_name)
+            stored_path = self.repository.store_artifact(research_id, artifact_id, text_content)
+            digest_bytes = text_content.encode("utf-8")
+        parsed = normalize_prediction_rows(parsed_source)
         now = datetime.now()
         artifact = ArtifactRecord(
             artifact_id=artifact_id,
             file_name=file_name,
-            sha256=hashlib.sha256(text_content.encode("utf-8")).hexdigest(),
-            size_bytes=len(text_content.encode("utf-8")),
+            sha256=hashlib.sha256(digest_bytes).hexdigest(),
+            size_bytes=len(digest_bytes),
             kind=kind,
             stored_path=str(stored_path),
             content_type=payload.get("content_type"),
@@ -393,6 +425,27 @@ class ResearchService:
             state.artifacts.extend(
                 [prediction_artifact, protocol_artifact, evidence_artifact]
             )
+            if not state.claims:
+                claim_scope = ClaimScope(
+                    target_id=target_label,
+                    unit=target_unit,
+                    coordinate_system=state.project.target.coordinate_system,
+                    horizon_days=horizon_days,
+                    baseline_protocol_id=protocol_hash_value,
+                )
+                state.claims.append(
+                    ClaimVersion(
+                        claim_id=f"CLM_{research_id[-10:]}",
+                        version=1,
+                        statement=(
+                            f"基于 LHAASO 日影特征的增强模型，对未来 {horizon_days} 天"
+                            f"{target_label}预测可能提供增量信息，"
+                            "但有效性、适用范围与稳健性尚需复核。"
+                        ),
+                        scope=claim_scope,
+                        status="unassessed",
+                    )
+                )
 
         next_state = self.repository.mutate(
             research_id,
@@ -781,6 +834,13 @@ class ResearchService:
                 status=422,
                 code="artifact_required",
             )
+        if artifact.kind != "prediction_csv":
+            raise ResearchApiError(
+                "预检只能使用预测结果 CSV（prediction_csv）；"
+                f"当前产物为 {artifact.kind}（{artifact.file_name}），报告等附件仅登记为证据。",
+                status=422,
+                code="predictions_required",
+            )
 
         try:
             content = self.repository.read_artifact(research_id, artifact.artifact_id)
@@ -834,22 +894,29 @@ class ResearchService:
                 code="invalid_horizon",
             )
 
-        packet = build_evidence_packet(
-            parsed=parsed,
-            protocol_hash_value=str(protocol_hash_value) if protocol_hash_value else None,
-            data_manifest_hash=data_manifest_hash,
-            run_id=payload.get("run_id"),
-            claim_ids=claim_ids,
-            target_id=str(payload.get("target_id") or project.target.id),
-            unit=project.target.unit,
-            horizon_days=horizon_days,
-            feature_columns=feature_columns,
-            base_arm=payload.get("base_arm"),
-            aug_arm=payload.get("aug_arm"),
-            primary_artifact_id=artifact.artifact_id,
-            primary_artifact_sha256=artifact.sha256,
-            imported_metrics=parsed_source.imported_metrics,
-        )
+        try:
+            packet = build_evidence_packet(
+                parsed=parsed,
+                protocol_hash_value=str(protocol_hash_value) if protocol_hash_value else None,
+                data_manifest_hash=data_manifest_hash,
+                run_id=payload.get("run_id"),
+                claim_ids=claim_ids,
+                target_id=str(payload.get("target_id") or project.target.id),
+                unit=project.target.unit,
+                horizon_days=horizon_days,
+                feature_columns=feature_columns,
+                base_arm=payload.get("base_arm"),
+                aug_arm=payload.get("aug_arm"),
+                primary_artifact_id=artifact.artifact_id,
+                primary_artifact_sha256=artifact.sha256,
+                imported_metrics=parsed_source.imported_metrics,
+            )
+        except ValueError as exc:
+            raise ResearchApiError(
+                str(exc),
+                status=422,
+                code="invalid_arms",
+            )
         if not packet.packet_id:
             packet.packet_id = f"EVP_{packet.packet_hash[:12]}"
 
@@ -948,6 +1015,50 @@ class ResearchService:
             )
         return packet, claim
 
+    def _ensure_initial_claim(
+        self,
+        research_id: str,
+        expected_revision: int,
+        packet: EvidencePacket,
+    ) -> tuple[ResearchRevision, ClaimVersion]:
+        current = self.repository.load_revision(research_id)
+        existing = next(iter(current.claims), None)
+        if existing is not None:
+            return current, existing
+        target = current.project.target
+        claim = ClaimVersion(
+            claim_id=f"CLM_{research_id[-10:]}",
+            version=1,
+            statement=(
+                f"基于 LHAASO 日影特征的增强模型，对未来 {current.project.horizon_days} 天"
+                f"{target.id}预测可能提供增量信息，"
+                "但有效性、适用范围与稳健性尚需复核。"
+            ),
+            scope=ClaimScope(
+                target_id=target.id,
+                unit=target.unit,
+                coordinate_system=target.coordinate_system,
+                horizon_days=current.project.horizon_days,
+                baseline_protocol_id=packet.protocol_hash,
+            ),
+            evidence_ids=[packet.packet_id],
+            status="unassessed",
+        )
+
+        def apply_initial_claim(state: ResearchRevision) -> None:
+            state.claims.append(claim)
+            for item in state.evidence_packets:
+                if item.packet_id == packet.packet_id:
+                    if claim.claim_id not in item.claim_ids:
+                        item.claim_ids.append(claim.claim_id)
+
+        next_state = self.repository.mutate(
+            research_id,
+            expected_revision=expected_revision,
+            mutation=apply_initial_claim,
+        )
+        return next_state, claim
+
     def start_review(
         self,
         research_id: str,
@@ -959,6 +1070,13 @@ class ResearchService:
         except ResearchProjectNotFoundError:
             raise ResearchApiError("研究项目不存在。", status=404, code="project_not_found")
         self._require_revision(current.revision, expected_revision)
+        provisional_packet = next(reversed(current.evidence_packets), None)
+        if provisional_packet is not None:
+            current, _claim_preflight = self._ensure_initial_claim(
+                research_id,
+                expected_revision=current.revision,
+                packet=provisional_packet,
+            )
         packet, claim = self._resolve_review_targets(current, payload)
 
         orchestrator = self._orchestrator()

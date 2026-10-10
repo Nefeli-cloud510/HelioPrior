@@ -234,7 +234,7 @@ function ResearchProjectList() {
                   id="research-title"
                   value={form.title}
                   onChange={(event) => setForm((prev) => ({ ...prev, title: event.target.value }))}
-                  placeholder="例如：LHAASO 日影对未来 IMF By 的增量预测研究"
+                  placeholder="例如：LHAASO 日影能否为太阳风速度提供增量预测"
                 />
               </div>
               <div className="research-field research-field--wide">
@@ -315,6 +315,8 @@ interface UploadDraft {
   kind: ArtifactKind
   content: string
   artifact_id: string
+  contentType?: string
+  contentEncoding?: 'base64'
 }
 
 function ClaimCard({ claim }: { claim: ClaimVersion }) {
@@ -433,6 +435,8 @@ function ResearchProjectDetailView({ researchId }: { researchId: string }) {
     kind: 'prediction_csv',
     content: '',
     artifact_id: '',
+    contentType: undefined,
+    contentEncoding: undefined,
   })
   const [featureColumns, setFeatureColumns] = useState('shadow_shift')
   const [baseArm, setBaseArm] = useState('base')
@@ -515,22 +519,52 @@ function ResearchProjectDetailView({ researchId }: { researchId: string }) {
     return list.length > 0 ? list[list.length - 1] : null
   }, [project?.artifacts])
 
+  const predictionArtifacts = useMemo(
+    () => (project?.artifacts ?? []).filter((item) => item.kind === 'prediction_csv'),
+    [project?.artifacts],
+  )
+  const latestPredictionArtifact = predictionArtifacts.length > 0 ? predictionArtifacts[predictionArtifacts.length - 1] : null
+
   const latestPacket = useMemo(() => {
     const list = project?.evidence_packets ?? []
     return list.length > 0 ? list[list.length - 1] : null
   }, [project?.evidence_packets])
+
+  function toBase64(bytes: Uint8Array): string {
+    let binary = ''
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+    }
+    return btoa(binary)
+  }
 
   async function handleFileSelected(file: File | undefined) {
     if (!file) {
       return
     }
     setActionError(null)
+    const lowerName = file.name.toLowerCase()
+    if (lowerName.endsWith('.pdf')) {
+      const bytes = new Uint8Array(await file.arrayBuffer())
+      setUploadDraft((prev) => ({
+        ...prev,
+        file_name: file.name,
+        content: toBase64(bytes),
+        kind: 'report',
+        contentType: file.type || 'application/pdf',
+        contentEncoding: 'base64',
+        artifact_id: '',
+      }))
+      return
+    }
     const text = await file.text()
     setUploadDraft((prev) => ({
       ...prev,
       file_name: file.name,
       content: text,
-      kind: file.name.toLowerCase().endsWith('.json') ? 'evidence_json' : 'prediction_csv',
+      kind: lowerName.endsWith('.json') ? 'evidence_json' : 'prediction_csv',
+      contentType: file.type || undefined,
+      contentEncoding: undefined,
       artifact_id: '',
     }))
   }
@@ -552,6 +586,8 @@ function ResearchProjectDetailView({ researchId }: { researchId: string }) {
         file_name: uploadDraft.file_name,
         kind: uploadDraft.kind,
         content: uploadDraft.content,
+        ...(uploadDraft.contentType ? { content_type: uploadDraft.contentType } : {}),
+        ...(uploadDraft.contentEncoding ? { content_encoding: uploadDraft.contentEncoding } : {}),
       })
       setProject(result.project)
       setUploadDraft((prev) => ({ ...prev, artifact_id: result.artifact.artifact_id }))
@@ -571,9 +607,12 @@ function ResearchProjectDetailView({ researchId }: { researchId: string }) {
       setPreflightBusy(true)
       setActionError(null)
       setActionNotice(null)
-      const artifactId = uploadDraft.artifact_id || latestArtifact?.artifact_id
+      const artifactId =
+        uploadDraft.artifact_id && predictionArtifacts.some((item) => item.artifact_id === uploadDraft.artifact_id)
+          ? uploadDraft.artifact_id
+          : latestPredictionArtifact?.artifact_id
       if (!artifactId) {
-        throw new Error('请先导入至少一份预测 CSV。')
+        throw new Error('预检需要预测结果 CSV；当前项目只有报告 PDF 等附件，请先上传 prediction_csv。')
       }
       const result = await runResearchPreflight(researchId, project.revision, {
         artifact_id: artifactId,
@@ -789,11 +828,11 @@ function ResearchProjectDetailView({ researchId }: { researchId: string }) {
               </div>
               <div className="research-form-grid">
                 <div className="research-field research-field--wide">
-                  <label htmlFor="artifact-file">预测 CSV / 证据 JSON</label>
+                  <label htmlFor="artifact-file">预测 CSV / 证据 JSON / 报告 PDF</label>
                   <input
                     id="artifact-file"
                     type="file"
-                    accept=".csv,.txt,.json"
+                    accept=".csv,.txt,.json,.pdf"
                     onChange={(event) => void handleFileSelected(event.target.files?.[0])}
                   />
                 </div>
@@ -802,6 +841,7 @@ function ResearchProjectDetailView({ researchId }: { researchId: string }) {
                   <select
                     id="artifact-kind"
                     value={uploadDraft.kind}
+                    disabled={uploadDraft.contentEncoding === 'base64'}
                     onChange={(event) =>
                       setUploadDraft((prev) => ({ ...prev, kind: event.target.value as ArtifactKind }))
                     }
@@ -822,14 +862,24 @@ function ResearchProjectDetailView({ researchId }: { researchId: string }) {
                   />
                 </div>
                 <div className="research-field research-field--wide">
-                  <label htmlFor="artifact-content">内容（或粘贴文本）</label>
+                  <label htmlFor="artifact-content">{uploadDraft.contentEncoding === 'base64' ? '原始文件' : '内容（或粘贴文本）'}</label>
                   <textarea
                     id="artifact-content"
-                    value={uploadDraft.content}
+                    value={uploadDraft.contentEncoding === 'base64' ? '' : uploadDraft.content}
+                    disabled={uploadDraft.contentEncoding === 'base64'}
                     onChange={(event) => setUploadDraft((prev) => ({ ...prev, content: event.target.value }))}
-                    placeholder="选择文件后自动填充；也可以直接粘贴 CSV/JSON 原文。"
+                    placeholder={
+                      uploadDraft.contentEncoding === 'base64'
+                        ? 'PDF 将按原始文件登记，无需粘贴内容。'
+                        : '选择文件后自动填充；也可以直接粘贴 CSV/JSON 原文。'
+                    }
                   />
                 </div>
+                {uploadDraft.contentEncoding === 'base64' ? (
+                  <p className="detail-card__meta" style={{ marginTop: 8 }}>
+                    已读取 PDF 原始字节约 {Math.round(uploadDraft.content.length * 0.75)} 字节，登记后生成 SHA-256。
+                  </p>
+                ) : null}
               </div>
               <div className="research-actions">
                 <button className="research-primary" type="button" disabled={uploadBusy} onClick={() => void uploadArtifact()}>
@@ -856,18 +906,25 @@ function ResearchProjectDetailView({ researchId }: { researchId: string }) {
                   <label htmlFor="preflight-artifact">证据产物</label>
                   <select
                     id="preflight-artifact"
-                    value={uploadDraft.artifact_id || latestArtifact?.artifact_id || ''}
+                    value={
+                      uploadDraft.artifact_id && predictionArtifacts.some((item) => item.artifact_id === uploadDraft.artifact_id)
+                        ? uploadDraft.artifact_id
+                        : latestPredictionArtifact?.artifact_id ?? ''
+                    }
                     onChange={(event) => setUploadDraft((prev) => ({ ...prev, artifact_id: event.target.value }))}
                   >
-                    {(project.artifacts.length > 0
-                      ? project.artifacts
-                      : [{ artifact_id: '', file_name: '（无产物）' } as ArtifactRecord]
+                    {(predictionArtifacts.length > 0
+                      ? predictionArtifacts
+                      : [{ artifact_id: '', file_name: '（无预测 CSV）' } as ArtifactRecord]
                     ).map((item) => (
                       <option key={item.artifact_id} value={item.artifact_id}>
                         {item.file_name} · {item.artifact_id}
                       </option>
                     ))}
                   </select>
+                  {predictionArtifacts.length === 0 ? (
+                    <p className="detail-card__meta">预检只接受预测结果 CSV；报告 PDF 单独登记为证据附件。</p>
+                  ) : null}
                 </div>
                 <div className="research-field">
                   <label htmlFor="preflight-features">特征列（逗号分隔）</label>
@@ -900,7 +957,12 @@ function ResearchProjectDetailView({ researchId }: { researchId: string }) {
                 </div>
               </div>
               <div className="research-actions">
-                <button className="research-primary" type="button" disabled={preflightBusy} onClick={() => void runPreflight()}>
+                <button
+                  className="research-primary"
+                  type="button"
+                  disabled={preflightBusy || predictionArtifacts.length === 0}
+                  onClick={() => void runPreflight()}
+                >
                   {preflightBusy ? '预检中……' : '运行证据预检'}
                 </button>
               </div>

@@ -126,6 +126,27 @@ select {
   flex-wrap: wrap;
 }
 
+.page-tabs__workbench {
+  display: inline-flex;
+  align-items: center;
+  margin-left: auto;
+  min-height: 40px;
+  padding: 8px 16px;
+  border-radius: 14px 14px 0 0;
+  border: 1px solid rgba(194, 106, 42, 0.34);
+  border-bottom: 0;
+  background: rgba(194, 106, 42, 0.14);
+  color: #4a2f18;
+  font-size: 13px;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.page-tabs__workbench:hover {
+  background: rgba(194, 106, 42, 0.24);
+  color: #3a2410;
+}
+
 .workspace-round-chip {
   display: inline-flex;
   align-items: center;
