@@ -609,6 +609,8 @@ class ExperimentResult(ShadowBaseModel):
     experiment_id: str = Field(min_length=1)
     round_id: int = Field(ge=0)
     status: ExecutionStatus
+    protocol_version: str | None = None
+    protocol_hash: str | None = None
     runs: list[ExperimentRun] = Field(default_factory=list)
     comparison: MetricDelta = Field(default_factory=MetricDelta)
     visualizations: list[VisualizationArtifact] = Field(default_factory=list)

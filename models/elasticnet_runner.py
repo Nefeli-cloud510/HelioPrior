@@ -15,7 +15,15 @@ from sklearn.base import BaseEstimator
 from sklearn.linear_model import ElasticNet, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+from core.calendar_samples import (
+    SamplePlan,
+    build_calendar_split,
+    build_sample_plan,
+    prepare_calendar_frame,
+)
 
 warnings.filterwarnings("ignore")
 plt.switch_backend("Agg")
@@ -110,7 +118,11 @@ class MergedLoadResult:
 
 @dataclass
 class SlidingWindowResult:
-    """滑动窗口构造结果。窗口直接基于合并后剩余行构造。"""
+    """Calendar-aligned sliding window result.
+
+    Windows are constructed on the real calendar axis; a horizon is a calendar
+    difference, never a record-count offset.
+    """
 
     X_all: np.ndarray
     y_all: np.ndarray
@@ -118,6 +130,11 @@ class SlidingWindowResult:
     feature_names: list[str]
     dropped_gap_windows: int = 0
     total_windows: int = 0
+    origins_all: np.ndarray | None = None
+    sample_plan: SamplePlan | None = None
+    window_mode: str = "calendar"
+    retained_before_filter: int = 0
+    common_sample_excluded: int = 0
 
 def load_llm_json_config(json_path: str | Path) -> ExperimentConfig:
     try:
@@ -300,59 +317,155 @@ def build_sliding_window(
     y_raw: pd.Series,
     time_raw: pd.Series,
     tw_cfg: TimeWindowConfig,
+    only_keys: set[tuple[str, str, int]] | None = None,
 ) -> SlidingWindowResult:
     window_size = tw_cfg.window_size
     forecast_horizon = tw_cfg.forecast_horizon_days
     past_lag_days = tw_cfg.past_lag_days or window_size
-    if len(X_raw) <= window_size + forecast_horizon:
-        raise ValueError(f"有效样本数 {len(X_raw)} 小于窗口大小 {window_size} 加超前天数 {forecast_horizon}")
-
-    arr_x = X_raw.to_numpy(dtype=float)
-    arr_y = y_raw.to_numpy(dtype=float)
-    arr_t = pd.to_datetime(time_raw).to_numpy()
-
-    X_all, y_all, time_all = [], [], []
-    dropped_gap_windows = 0
-    total_windows = 0
     feature_names = []
     for lag in range(past_lag_days, 0, -1):
         for col in X_raw.columns:
             feature_names.append(f"{col}_t-{lag}")
 
-    for i in range(window_size, len(arr_x) - forecast_horizon):
-        total_windows += 1
-        X_all.append(arr_x[i - past_lag_days:i, :].reshape(-1))
-        y_all.append(arr_y[i + forecast_horizon])
-        time_all.append(arr_t[i + forecast_horizon])
+    plan = build_sample_plan(
+        X_raw,
+        y_raw,
+        time_raw,
+        feature_names=X_raw.columns,
+        target_name=y_raw.name or "target",
+        window_size=window_size,
+        past_lag_days=past_lag_days,
+        forecast_horizon_days=forecast_horizon,
+    )
+    records = [record for record in plan.records if record.drop_reason is None]
+    retained_before_filter = len(records)
+    if only_keys is not None:
+        records = [
+            record for record in records
+            if record.compact_key() in only_keys
+        ]
+    if not records:
+        detail = (
+            f"calendar plan retained 0 samples "
+            f"(candidate={plan.candidate_count}, dropped={plan.dropped_count})"
+        )
+        raise ValueError(detail)
+
+    frame = prepare_calendar_frame(X_raw, y_raw, time_raw)
+    frame = frame.sort_values("_hp_time").reset_index(drop=True)
+    arr_x = frame[X_raw.columns].to_numpy(dtype=float)
+    arr_y = frame["_hp_target"].to_numpy(dtype=float)
+    sorted_times = frame["_hp_time"].to_numpy()
+    date_to_index = {
+        pd.Timestamp(value).normalize(): idx
+        for idx, value in enumerate(sorted_times)
+    }
+
+    X_all, y_all, time_all, origins_all = [], [], [], []
+    for record in records:
+        values: list[float] = []
+        for date_text in record.feature_dates:
+            row_index = date_to_index[pd.Timestamp(date_text).normalize()]
+            values.extend(arr_x[row_index])
+        target_index = date_to_index[record.target_time.normalize()]
+        X_all.append(values)
+        y_all.append(arr_y[target_index])
+        time_all.append(record.target_time.to_datetime64())
+        origins_all.append(record.forecast_origin.to_datetime64())
 
     return SlidingWindowResult(
-        X_all=np.asarray(X_all),
-        y_all=np.asarray(y_all),
+        X_all=np.asarray(X_all, dtype=float),
+        y_all=np.asarray(y_all, dtype=float),
         time_all=np.asarray(time_all),
         feature_names=feature_names,
-        dropped_gap_windows=dropped_gap_windows,
-        total_windows=total_windows,
+        dropped_gap_windows=max(0, plan.candidate_count - retained_before_filter),
+        total_windows=plan.candidate_count,
+        origins_all=np.asarray(origins_all),
+        sample_plan=plan,
+        window_mode="calendar",
+        retained_before_filter=retained_before_filter,
+        common_sample_excluded=max(0, retained_before_filter - len(records)),
     )
 
+
+@dataclass
+class DatasetSplit:
+    X_train: pd.DataFrame
+    X_test: pd.DataFrame
+    y_train: np.ndarray
+    y_test: np.ndarray
+    time_train: np.ndarray
+    time_test: np.ndarray
+    origin_train: np.ndarray | None = None
+    origin_test: np.ndarray | None = None
+    split_date: pd.Timestamp | None = None
+    train_mask: np.ndarray | None = None
+
+
+def split_dataset_by_date(
+    X_all: np.ndarray,
+    y_all: np.ndarray,
+    time_all: np.ndarray,
+    test_rate: float,
+    feature_names: list[str],
+    origins_all: np.ndarray | None = None,
+) -> DatasetSplit:
+    """Split samples by calendar date; both arms share the same test boundary."""
+
+    train_mask, split_date = build_calendar_split(
+        pd.Series(time_all),
+        test_rate,
+    )
+    X_arr = np.asarray(X_all, dtype=float)
+    y_arr = np.asarray(y_all, dtype=float)
+
+    def _select(offset: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        mask = train_mask if offset == 0 else ~train_mask
+        return X_arr[mask], y_arr[mask], np.asarray(time_all)[mask]
+
+    Xtr_arr, ytr, ttr = _select(0)
+    Xte_arr, yte, tte = _select(1)
+    origin_train = None
+    origin_test = None
+    if origins_all is not None:
+        origin_train = np.asarray(origins_all)[train_mask]
+        origin_test = np.asarray(origins_all)[~train_mask]
+
+    split = DatasetSplit(
+        X_train=pd.DataFrame(Xtr_arr, columns=feature_names),
+        X_test=pd.DataFrame(Xte_arr, columns=feature_names),
+        y_train=ytr,
+        y_test=yte,
+        time_train=ttr,
+        time_test=tte,
+        origin_train=origin_train,
+        origin_test=origin_test,
+        split_date=split_date,
+        train_mask=train_mask,
+    )
+    return split
+
+
 def split_and_scale_dataset(X_all: np.ndarray, y_all: np.ndarray, time_all: np.ndarray, test_rate: float, feature_names: List[str]):
-    split_idx = int(len(X_all) * (1 - test_rate))
-    if split_idx <= 0 or split_idx >= len(X_all):
-        raise ValueError("测试集比例导致训练集或测试集为空")
-
-    Xtr = X_all[:split_idx]
-    Xte = X_all[split_idx:]
-    ytr = y_all[:split_idx]
-    yte = y_all[split_idx:]
-    ttr = time_all[:split_idx]
-    tte = time_all[split_idx:]
-
-    scaler = StandardScaler()
-    Xtr_scaled = scaler.fit_transform(Xtr)
-    Xte_scaled = scaler.transform(Xte)
-
-    Xtr_df = pd.DataFrame(Xtr_scaled, columns=feature_names)
-    Xte_df = pd.DataFrame(Xte_scaled, columns=feature_names)
-    return Xtr_df, Xte_df, ytr, yte, ttr, tte, scaler
+    split = split_dataset_by_date(
+        X_all,
+        y_all,
+        time_all,
+        test_rate,
+        feature_names,
+    )
+    # 新训练路径在 Pipeline 内完成缩放，因此这里返回原始分割与适配训练集的
+    # scaler，避免旧路径被重复标准化。
+    scaler = StandardScaler().fit(split.X_train)
+    return (
+        split.X_train,
+        split.X_test,
+        split.y_train,
+        split.y_test,
+        split.time_train,
+        split.time_test,
+        scaler,
+    )
 
 
 # 模型训练与评估
@@ -390,12 +503,23 @@ def make_model(cfg: ElasticNetConfig, alpha_override: float | None = None) -> Ba
     )
 
 
+def resolve_alpha_for_model(model: BaseEstimator, default: float) -> float:
+    """Read the fitted alpha from a Pipeline or a bare estimator."""
+
+    estimator = model.named_steps["model"] if isinstance(model, Pipeline) else model
+    return float(getattr(estimator, "alpha", default))
+
+
 def select_best_alpha(
     Xtr: pd.DataFrame,
     ytr: np.ndarray,
     cfg: ElasticNetConfig,
 ) -> float:
-    """Ridge 在训练集内按时序折选 alpha，与 astro_rearrange 的网格做法对齐。"""
+    """Ridge 在训练集内按时序折选 alpha。
+
+    缩放器与模型一起进入 Pipeline，每个 CV fold 都只使用对应训练子集拟合
+    scaler，避免折内预处理泄漏。
+    """
     if resolve_model_family(cfg) != "ridge":
         return float(cfg.alpha)
     grid = [float(value) for value in getattr(cfg, "alpha_grid", []) if float(value) > 0]
@@ -404,14 +528,10 @@ def select_best_alpha(
     n_splits = min(2, len(Xtr) // 2)
     if n_splits < 1:
         return float(cfg.alpha)
-    model = Ridge(
-        fit_intercept=cfg.fit_intercept,
-        solver=cfg.ridge_solver,
-        random_state=cfg.random_state,
-    )
+    model = make_model(cfg)
     search = GridSearchCV(
-        model,
-        {"alpha": grid},
+        Pipeline([("scaler", StandardScaler()), ("model", model)]),
+        {"model__alpha": grid},
         cv=TimeSeriesSplit(n_splits=n_splits),
         scoring="neg_mean_squared_error",
         refit=True,
@@ -419,7 +539,7 @@ def select_best_alpha(
         n_jobs=1,
     )
     search.fit(Xtr, ytr)
-    return float(search.best_params_["alpha"])
+    return float(search.best_params_["model__alpha"])
 
 
 def train_elasticnet_model(
@@ -429,8 +549,9 @@ def train_elasticnet_model(
 ) -> BaseEstimator:
     alpha = select_best_alpha(Xtr, ytr, enet_cfg)
     model = make_model(enet_cfg, alpha_override=alpha)
-    model.fit(Xtr, ytr)
-    return model
+    pipeline = Pipeline([("scaler", StandardScaler()), ("model", model)])
+    pipeline.fit(Xtr, ytr)
+    return pipeline
 
 # 旧入口的兼容别名；新代码建议使用 train_model。
 train_model = train_elasticnet_model
@@ -460,9 +581,10 @@ def evaluate_model(
     return metrics, ytr_pred, yte_pred
 
 def make_coefficient_table(model: BaseEstimator, feat_names: List[str]) -> pd.DataFrame:
+    estimator = model.named_steps["model"] if isinstance(model, Pipeline) else model
     coef_df = pd.DataFrame({
         "feature": feat_names,
-        "coefficient": model.coef_
+        "coefficient": estimator.coef_
     })
     coef_df["abs_coefficient"] = coef_df["coefficient"].abs()
     return coef_df.sort_values("abs_coefficient", ascending=False).reset_index(drop=True)
@@ -669,7 +791,7 @@ def run_shap_analysis(
             return name, int(lag_text)
         return str(feature), None
 
-    explainer = shap.Explainer(model, Xtr)
+    explainer = shap.Explainer(model.predict, Xtr)
     shap_values = explainer(Xte)
     prefix = "elasticnet" if model_family == "elasticnet" else "ridge"
 
@@ -771,7 +893,10 @@ def main(config_path: str):
     coef_df = make_coefficient_table(model, feature_names)
     coef_df.to_csv(output_dir / f"{output_prefix}_coefficients.csv", index=False, encoding="utf-8-sig")
     metrics["model_family"] = model_family
-    metrics["alpha_selected"] = float(getattr(model, "alpha", cfg.elasticnet_config.alpha))
+    metrics["alpha_selected"] = resolve_alpha_for_model(
+        model,
+        cfg.elasticnet_config.alpha,
+    )
     with open(output_dir / f"{output_prefix}_metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
 

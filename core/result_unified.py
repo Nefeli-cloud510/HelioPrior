@@ -42,6 +42,8 @@ def build_experiment_result(
     visualizations: list[VisualizationArtifact],
     duration_seconds: float,
     data_coverage: list[DataSourceCoverage] | None = None,
+    protocol_version: str | None = None,
+    protocol_hash: str | None = None,
 ) -> ExperimentResult:
     baseline_metrics = baseline_output["metrics"]
     treatment_metrics = treatment_output["metrics"]
@@ -50,6 +52,8 @@ def build_experiment_result(
         experiment_id=protocol.experiment_id,
         round_id=protocol.round_id,
         status="completed",
+        protocol_version=protocol_version,
+        protocol_hash=protocol_hash,
         runs=[
             ExperimentRun(
                 run_id="baseline",
@@ -92,6 +96,8 @@ def export_result_bundle(
     latest_metrics_payload = {
         "experiment_id": result.experiment_id,
         "round_id": result.round_id,
+        "protocol_version": result.protocol_version,
+        "protocol_hash": result.protocol_hash,
         "model": {
             "name": protocol.model.name,
             "parameters": protocol.model.parameters,

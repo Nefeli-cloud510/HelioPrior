@@ -5,8 +5,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import StandardScaler
 
 from core.protocol_bridge import ElasticNetDataSourceConfig, ElasticNetProtocolBridge
+from core.protocol_hash import PROTOCOL_VERSION, protocol_hash
 from core.method_registry import METHOD_REGISTRY
 from core.result_unified import build_experiment_result, export_result_bundle
 from core.unified_schema import (
@@ -15,6 +17,17 @@ from core.unified_schema import (
     ExperimentResult,
     VisualizationArtifact,
 )
+from models.elasticnet_runner import resolve_alpha_for_model
+
+
+def _values_differ(baseline_y: float | None, treatment_y: float | None) -> bool:
+    if baseline_y is None or treatment_y is None:
+        return baseline_y != treatment_y
+    if np.isnan(baseline_y) or np.isnan(treatment_y):
+        return not (np.isnan(baseline_y) and np.isnan(treatment_y))
+    return not bool(
+        np.isclose(baseline_y, treatment_y, rtol=1e-5, atol=1e-6)
+    )
 
 
 class UnifiedExperimentHarness:
@@ -67,21 +80,41 @@ class UnifiedExperimentHarness:
                 feature_columns=baseline_features,
                 label="baseline",
                 output_dir=execution_dir / "baseline",
+                only_keys=None,
             )
             treatment_output = baseline_output
         else:
+            baseline_keys = self._build_retained_keys(
+                protocol=protocol,
+                feature_columns=baseline_features,
+                label="baseline",
+            )
+            treatment_keys = self._build_retained_keys(
+                protocol=protocol,
+                feature_columns=treatment_features,
+                label="treatment",
+            )
+            common_keys = baseline_keys & treatment_keys
+            if not common_keys:
+                raise ValueError(
+                    "日历对齐后对照组与增强组没有共同样本，"
+                    "不能进行同样本对比实验"
+                )
             baseline_output = self._execute_variant(
                 protocol=protocol,
                 feature_columns=baseline_features,
                 label="baseline",
                 output_dir=execution_dir / "baseline",
+                only_keys=common_keys,
             )
             treatment_output = self._execute_variant(
                 protocol=protocol,
                 feature_columns=treatment_features,
                 label="treatment",
                 output_dir=execution_dir / "treatment",
+                only_keys=common_keys,
             )
+        self._assert_paired_predictions(baseline_output, treatment_output)
         duration_seconds = time.perf_counter() - started
 
         predictions_dir = execution_dir / "predictions"
@@ -111,6 +144,8 @@ class UnifiedExperimentHarness:
             visualizations=visualizations,
             duration_seconds=duration_seconds,
             data_coverage=coverage_entries,
+            protocol_version=baseline_output.get("protocol_version"),
+            protocol_hash=baseline_output.get("protocol_hash"),
         )
         export_result_bundle(
             result,
@@ -144,6 +179,7 @@ class UnifiedExperimentHarness:
         feature_columns: list[str],
         label: str,
         output_dir: Path,
+        only_keys: set[tuple[str, str, int]] | None = None,
     ) -> dict:
         output_dir.mkdir(parents=True, exist_ok=True)
         method = METHOD_REGISTRY.get(protocol.model.name)
@@ -162,21 +198,29 @@ class UnifiedExperimentHarness:
             merged.y,
             merged.time,
             runner_config.time_window_config,
+            only_keys=only_keys,
         )
-        xtr, xte, ytr, yte, time_train, time_test, scaler = runner.split_and_scale_dataset(
+        split = runner.split_dataset_by_date(
             window_result.X_all,
             window_result.y_all,
             window_result.time_all,
             runner_config.time_window_config.test_split_ratio,
             window_result.feature_names,
+            origins_all=window_result.origins_all,
         )
+        xtr, xte = split.X_train, split.X_test
+        ytr, yte = split.y_train, split.y_test
+        time_train, time_test = split.time_train, split.time_test
+        origin_test = split.origin_test
+        scaler = StandardScaler().fit(xtr)
 
         model_family = runner_config.elasticnet_config.model_family
         model = runner.train_model(xtr, ytr, runner_config.elasticnet_config)
         metrics, ytr_pred, yte_pred = runner.evaluate_model(model, xtr, xte, ytr, yte)
         metrics["model_family"] = model_family
-        metrics["alpha_selected"] = float(
-            getattr(model, "alpha", runner_config.elasticnet_config.alpha),
+        metrics["alpha_selected"] = resolve_alpha_for_model(
+            model,
+            runner_config.elasticnet_config.alpha,
         )
         coef_df = runner.make_coefficient_table(model, window_result.feature_names)
         coef_df.to_csv(output_dir / f"{label}_coefficients.csv", index=False, encoding="utf-8-sig")
@@ -263,6 +307,7 @@ class UnifiedExperimentHarness:
 
         return {
             "label": label,
+            "run_id": f"{protocol.experiment_id}_{label}",
             "config": runner_config.model_dump(mode="json"),
             "metrics": metrics,
             "coefficients": coef_df,
@@ -270,6 +315,10 @@ class UnifiedExperimentHarness:
             "scaler": scaler,
             "time_train": time_train,
             "time_test": time_test,
+            "origin_test": origin_test,
+            "horizon_days": int(runner_config.time_window_config.forecast_horizon_days),
+            "protocol_version": PROTOCOL_VERSION,
+            "protocol_hash": protocol_hash(runner_config.model_dump(mode="json")),
             "y_train": ytr,
             "y_test": yte,
             "y_train_pred": ytr_pred,
@@ -280,19 +329,100 @@ class UnifiedExperimentHarness:
             "data_coverage": coverage_entries,
             "sliding_window_total": window_result.total_windows,
             "sliding_window_dropped": window_result.dropped_gap_windows,
+            "sliding_window_common_sample_excluded": window_result.common_sample_excluded,
         }
+
+    def _build_retained_keys(
+        self,
+        *,
+        protocol: ExperimentProtocol,
+        feature_columns: list[str],
+        label: str,
+    ) -> set[tuple[str, str, int]]:
+        """Load each arm's calendar-eligible samples before execution and return retained keys."""
+
+        method = METHOD_REGISTRY.get(protocol.model.name)
+        runner = METHOD_REGISTRY.runner_for(method.method_id)
+        arm_windows = protocol.model.parameters.get("arm_time_windows")
+        arm_overrides = arm_windows.get(label) if isinstance(arm_windows, dict) else None
+        runner_config = self.bridge.build_runner_config(
+            protocol,
+            feature_columns,
+            arm_overrides=arm_overrides,
+        )
+        merged = runner.load_and_merge_data(runner_config)
+        window_result = runner.build_sliding_window(
+            merged.X,
+            merged.y,
+            merged.time,
+            runner_config.time_window_config,
+        )
+        if window_result.sample_plan is None:
+            raise ValueError("日历样本计划缺失，无法计算共同样本")
+        return window_result.sample_plan.compact_keys()
 
     @staticmethod
     def _write_prediction_csv(file_path: Path, execution_output: dict) -> Path:
+        target_time = pd.to_datetime(execution_output["time_test"])
+        forecast_origin = pd.to_datetime(execution_output["origin_test"])
         frame = pd.DataFrame(
             {
-                "time": pd.to_datetime(execution_output["time_test"]).astype(str),
+                "run_id": execution_output["run_id"],
+                "split": "test",
+                "forecast_origin": forecast_origin.astype(str),
+                "target_time": target_time.astype(str),
+                "horizon_days": int(execution_output["horizon_days"]),
+                "time": target_time.astype(str),
                 "y_true": execution_output["y_test"],
                 "y_pred": execution_output["y_test_pred"],
+                "protocol_version": execution_output["protocol_version"],
+                "protocol_hash": execution_output["protocol_hash"],
             }
         )
         frame.to_csv(file_path, index=False, encoding="utf-8-sig")
         return file_path
+
+    @staticmethod
+    def _assert_paired_predictions(baseline_output: dict, treatment_output: dict) -> None:
+        """Block a comparison unless both arms cover identical test origins/targets."""
+
+        if baseline_output is treatment_output:
+            return
+        baseline_pairs = UnifiedExperimentHarness._prediction_pairs(baseline_output)
+        treatment_pairs = UnifiedExperimentHarness._prediction_pairs(treatment_output)
+        baseline_keys = set(baseline_pairs)
+        treatment_keys = set(treatment_pairs)
+        if baseline_keys != treatment_keys:
+            only_baseline = baseline_keys - treatment_keys
+            only_treatment = treatment_keys - baseline_keys
+            raise ValueError(
+                "双路预测样本不一致，禁止比较："
+                f"仅对照组 {len(only_baseline)} 条，仅增强组 {len(only_treatment)} 条"
+            )
+        for key in sorted(baseline_keys):
+            baseline_y = baseline_pairs[key]
+            treatment_y = treatment_pairs[key]
+            if _values_differ(baseline_y, treatment_y):
+                raise ValueError(
+                    f"双路预测同一样本真实目标不一致: {key} "
+                    f"baseline={baseline_y!r} treatment={treatment_y!r}"
+                )
+
+    @staticmethod
+    def _prediction_pairs(execution_output: dict) -> dict[tuple, float | None]:
+        origins = pd.to_datetime(execution_output["origin_test"])
+        targets = pd.to_datetime(execution_output["time_test"])
+        horizon = int(execution_output["horizon_days"])
+        raw_ys = execution_output["y_test"]
+        pairs: dict[tuple, float | None] = {}
+        for origin, target, raw in zip(origins, targets, raw_ys):
+            key = (
+                origin.date().isoformat(),
+                target.date().isoformat(),
+                horizon,
+            )
+            pairs[key] = float(raw) if raw is not None else None
+        return pairs
 
     def _collect_visualizations(
         self,
