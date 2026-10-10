@@ -141,7 +141,7 @@ python -m unittest tests.test_research_validation tests.test_research_api tests.
 
 ## 7. 当前实现边界
 
-- 前端已接线页面：`/research`、`/research/:researchId`、`/research/:researchId/evidence`。主页与主导航仍以 legacy 闭环为主，`/research` 作为 research_review 工作台入口，未声称完成全站 UI 重构。
+- 前端已接线页面：`/research`、`/research/:researchId`、`/research/:researchId/evidence`、`/research/:researchId/review`、`/research/:researchId/validate`、`/research/:researchId/report`。项目内导航固定为“项目总览 / 证据中心 / 协作复核 / 验证实验 / 研究报告”。主页与主导航仍以 legacy 闭环为主，`/research` 作为 research_review 工作台入口，未声称完成全站 UI 重构。
 - research_review 存储与 legacy 存储完全隔离，互不迁移、互不覆盖。
 - 主链路目标 LLM 调用预算约 3-5 次；端到端闭环测试以 4 次主调用通过。
 - 未接线功能（如 `hypotheses`、`evidence`、`decisions`、`jobs` 等 v2 子接口）返回明确的 501，不计入“已完成”。
