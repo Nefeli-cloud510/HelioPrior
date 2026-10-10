@@ -16,6 +16,14 @@ from core.research_repository import (
     ResearchProjectNotFoundError,
     ResearchRepository,
 )
+from core.review_orchestrator import (
+    REVIEW_ROLES,
+    DualReviewResult,
+    ResearchReviewError,
+    ReviewOrchestrator,
+    build_review_mutation,
+    review_request_hash,
+)
 from core.research_schema import (
     SCHEMA_VERSION,
     ArtifactKind,
@@ -56,8 +64,17 @@ class ApiResult:
 class ResearchService:
     """State transitions and API actions for the research-review workflow."""
 
-    def __init__(self, repository: ResearchRepository) -> None:
+    def __init__(
+        self,
+        repository: ResearchRepository,
+        *,
+        gateway: Any | None = None,
+    ) -> None:
         self.repository = repository
+        self.gateway = gateway
+
+    def _orchestrator(self) -> ReviewOrchestrator:
+        return ReviewOrchestrator(gateway=self.gateway)
 
     def create_project(
         self,
@@ -368,6 +385,376 @@ class ResearchService:
         }
         return ApiResult(status=200, payload=result.payload)
 
+    def _resolve_review_targets(
+        self,
+        revision: ResearchRevision,
+        payload: dict[str, Any],
+    ) -> tuple[EvidencePacket, ClaimVersion]:
+        packet_id = str(payload.get("packet_id") or "").strip()
+        if packet_id:
+            packet = next(
+                (item for item in revision.evidence_packets if item.packet_id == packet_id),
+                None,
+            )
+            if packet is None:
+                raise ResearchApiError(
+                    f"证据包不存在：{packet_id}",
+                    status=404,
+                    code="packet_not_found",
+                )
+        else:
+            packet = next(reversed(revision.evidence_packets), None)
+        if packet is None:
+            raise ResearchApiError(
+                "复核需要至少一个证据包，请先运行证据预检。",
+                status=422,
+                code="evidence_packet_required",
+            )
+
+        claim_id = str(payload.get("claim_id") or "").strip()
+        if claim_id:
+            claim = next(
+                (item for item in revision.claims if item.claim_id == claim_id),
+                None,
+            )
+            if claim is None:
+                raise ResearchApiError(
+                    f"研究结论不存在：{claim_id}",
+                    status=404,
+                    code="claim_not_found",
+                )
+        else:
+            by_packet = [
+                claim
+                for claim in revision.claims
+                if not packet.claim_ids or claim.claim_id in packet.claim_ids
+            ]
+            claim = by_packet[0] if by_packet else next(iter(revision.claims), None)
+        if claim is None:
+            raise ResearchApiError(
+                "复核需要至少一条研究结论。",
+                status=422,
+                code="claim_required",
+            )
+        return packet, claim
+
+    def start_review(
+        self,
+        research_id: str,
+        expected_revision: int,
+        payload: dict[str, Any],
+    ) -> ApiResult:
+        try:
+            current = self.repository.load_revision(research_id)
+        except ResearchProjectNotFoundError:
+            raise ResearchApiError("研究项目不存在。", status=404, code="project_not_found")
+        self._require_revision(current.revision, expected_revision)
+        packet, claim = self._resolve_review_targets(current, payload)
+
+        orchestrator = self._orchestrator()
+        result = orchestrator.run_dual_review(
+            packet=packet,
+            claim=claim,
+            project=current.project,
+            frozen_revision=current.revision,
+        )
+        next_state = self.repository.mutate(
+            research_id,
+            expected_revision=current.revision,
+            mutation=build_review_mutation(
+                review_id=result.review_id,
+                result=result,
+            ),
+        )
+        return self._review_response(next_state, result)
+
+    def retry_review(
+        self,
+        research_id: str,
+        expected_revision: int,
+        review_id: str,
+        payload: dict[str, Any],
+    ) -> ApiResult:
+        try:
+            current = self.repository.load_revision(research_id)
+        except ResearchProjectNotFoundError:
+            raise ResearchApiError("研究项目不存在。", status=404, code="project_not_found")
+        self._require_revision(current.revision, expected_revision)
+
+        review_opinions = [
+            opinion
+            for opinion in current.opinions
+            if opinion.review_id == review_id
+        ]
+        review_jobs = [
+            job
+            for job in current.jobs
+            if job.review_id == review_id and job.kind == "dual_review"
+        ]
+        if not review_opinions and not review_jobs:
+            raise ResearchApiError(
+                f"复核不存在：{review_id}",
+                status=404,
+                code="review_not_found",
+            )
+
+        completed_roles = {
+            opinion.role
+            for opinion in review_opinions
+            if opinion.status == "completed"
+        }
+        missing_roles = [
+            role for role in REVIEW_ROLES if role not in completed_roles
+        ]
+        if not missing_roles:
+            raise ResearchApiError(
+                "该复核已完成，没有失败或缺失的审读角色。",
+                status=409,
+                code="review_not_retryable",
+            )
+
+        raw_roles = payload.get("retry_roles") or missing_roles
+        if not isinstance(raw_roles, (list, tuple)):
+            raise ResearchApiError(
+                "retry_roles 必须是角色数组。",
+                status=422,
+                code="invalid_retry_roles",
+            )
+        retry_roles = tuple(dict.fromkeys(str(item) for item in raw_roles))
+        invalid_roles = [role for role in retry_roles if role not in REVIEW_ROLES]
+        if invalid_roles:
+            raise ResearchApiError(
+                f"未知审读角色：{', '.join(invalid_roles)}",
+                status=422,
+                code="invalid_retry_roles",
+            )
+
+        packet_hash = str(payload.get("packet_hash") or "").strip()
+        if packet_hash:
+            packet = next(
+                (
+                    item
+                    for item in current.evidence_packets
+                    if item.packet_hash == packet_hash
+                ),
+                None,
+            )
+            if packet is None:
+                raise ResearchApiError(
+                    "重试指定的证据包不存在。",
+                    status=404,
+                    code="packet_not_found",
+                )
+        else:
+            opinion_hashes = {opinion.packet_hash for opinion in review_opinions}
+            packet = next(
+                reversed(current.evidence_packets),
+                None,
+            )
+            if packet is not None and packet.packet_hash not in opinion_hashes and opinion_hashes:
+                packet = next(
+                    (
+                        item
+                        for item in reversed(current.evidence_packets)
+                        if item.packet_hash in opinion_hashes
+                    ),
+                    packet,
+                )
+        if packet is None:
+            raise ResearchApiError(
+                "重试需要证据包，请先运行证据预检。",
+                status=422,
+                code="evidence_packet_required",
+            )
+
+        claim_id = str(payload.get("claim_id") or "").strip()
+        if claim_id:
+            claim = next(
+                (item for item in current.claims if item.claim_id == claim_id),
+                None,
+            )
+        else:
+            claim = next(
+                (item for item in current.claims if item.claim_id in packet.claim_ids),
+                None,
+            ) or next(iter(current.claims), None)
+        if claim is None:
+            raise ResearchApiError(
+                "重试需要研究结论。",
+                status=422,
+                code="claim_required",
+            )
+
+        request_hash = next(
+            (
+                job.request_hash
+                for job in reversed(review_jobs)
+                if job.request_hash
+            ),
+            None,
+        )
+        if request_hash is None:
+            request_hash = next(
+                (
+                    call.request_hash
+                    for call in reversed(current.agent_calls)
+                    if call.request_hash and call.role in REVIEW_ROLES
+                ),
+                None,
+            )
+        if request_hash is None:
+            request_hash = review_request_hash(
+                packet_hash=packet.packet_hash,
+                claim_id=claim.claim_id,
+                claim_version=claim.version,
+                project_stage=current.project.stage,
+                frozen_revision=current.revision,
+                retry_roles=retry_roles,
+            )
+
+        orchestrator = self._orchestrator()
+        try:
+            attempt = max(2, int(payload.get("attempt") or 2))
+        except (TypeError, ValueError):
+            attempt = 2
+        result = orchestrator.run_dual_review(
+            packet=packet,
+            claim=claim,
+            project=current.project,
+            frozen_revision=current.revision,
+            retry_roles=retry_roles,
+            existing_opinions=review_opinions,
+            review_id=review_id,
+            request_hash=request_hash,
+            attempt=attempt,
+        )
+        next_state = self.repository.mutate(
+            research_id,
+            expected_revision=current.revision,
+            mutation=build_review_mutation(
+                review_id=review_id,
+                result=result,
+            ),
+        )
+        return self._review_response(next_state, result)
+
+    def list_disputes(self, research_id: str) -> ApiResult:
+        try:
+            revision = self.repository.load_revision(research_id)
+        except ResearchProjectNotFoundError:
+            raise ResearchApiError("研究项目不存在。", status=404, code="project_not_found")
+        dispute_ids = {dispute.dispute_id for dispute in revision.disputes}
+        return ApiResult(
+            status=200,
+            payload={
+                "research_id": research_id,
+                "revision": revision.revision,
+                "data": {
+                    "research_id": research_id,
+                    "revision": revision.revision,
+                    "project": revision.project.model_dump(exclude_none=True),
+                    "disputes": [
+                        dispute.model_dump(exclude_none=True)
+                        for dispute in revision.disputes
+                    ],
+                    "opinions": [
+                        opinion.model_dump(exclude_none=True)
+                        for opinion in revision.opinions
+                        if not dispute_ids or opinion.opinion_id in {
+                            opinion_id
+                            for dispute in revision.disputes
+                            for opinion_id in dispute.opinion_ids
+                        }
+                    ],
+                    "arbitrations": [
+                        arbitration.model_dump(exclude_none=True)
+                        for arbitration in revision.arbitrations
+                    ],
+                    "open_dispute_count": len(
+                        [
+                            dispute
+                            for dispute in revision.disputes
+                            if dispute.status
+                            not in {"dismissed", "validated", "superseded"}
+                        ]
+                    ),
+                },
+            },
+        )
+
+    def _require_revision(self, current_revision: int, expected_revision: Any) -> None:
+        try:
+            expected = int(expected_revision)
+        except (TypeError, ValueError):
+            raise ResearchApiError(
+                "expected_revision 必须是整数。",
+                status=422,
+                code="invalid_revision",
+            )
+        if current_revision != expected:
+            raise ResearchApiError(
+                f"版本冲突：当前 revision={current_revision}。",
+                status=409,
+                code="revision_conflict",
+                retryable=True,
+            )
+
+    def _review_response(
+        self,
+        revision: ResearchRevision,
+        result: DualReviewResult,
+    ) -> ApiResult:
+        base = self._project_response(revision, created=False)
+        data = base.payload["data"]
+        review_opinions = [
+            opinion
+            for opinion in revision.opinions
+            if opinion.review_id == result.review_id
+        ]
+        review_disputes = [
+            dispute
+            for dispute in revision.disputes
+            if dispute.review_id == result.review_id
+        ]
+        review_arbitrations = [
+            arbitration
+            for arbitration in revision.arbitrations
+            if arbitration.review_id == result.review_id
+        ]
+        review_calls = [
+            call
+            for call in revision.agent_calls
+            if call.request_hash == result.request_hash
+        ]
+        data["review"] = {
+            "review_id": result.review_id,
+            "status": result.status,
+            "stage": result.job.stage,
+            "packet_hash": result.packet_hash,
+            "claim_id": result.claim_id,
+            "request_hash": result.request_hash,
+            "is_stub": result.is_stub,
+            "message": result.message,
+            "job": result.job.model_dump(exclude_none=True),
+            "opinions": [
+                opinion.model_dump(exclude_none=True)
+                for opinion in review_opinions
+            ],
+            "disputes": [
+                dispute.model_dump(exclude_none=True)
+                for dispute in review_disputes
+            ],
+            "arbitrations": [
+                arbitration.model_dump(exclude_none=True)
+                for arbitration in review_arbitrations
+            ],
+            "agent_calls": [
+                call.model_dump(exclude_none=True)
+                for call in review_calls
+            ],
+        }
+        return ApiResult(status=200, payload=base.payload)
+
     def _build_project(
         self,
         payload: dict[str, Any],
@@ -498,6 +885,19 @@ class ResearchService:
             for packet in revision.evidence_packets
             for key, metric in packet.metrics.items()
         }
+        reviews = [
+            {
+                "review_id": job.review_id,
+                "job_id": job.job_id,
+                "status": job.status,
+                "stage": job.stage,
+                "request_hash": job.request_hash,
+                "kind": job.kind,
+                "message": job.message,
+            }
+            for job in revision.jobs
+            if job.kind == "dual_review"
+        ]
         data = {
             "project": project.model_dump(exclude_none=True),
             "revision": revision.revision,
@@ -506,6 +906,27 @@ class ResearchService:
             "evidence_packets": evidence_packets,
             "checks": checks,
             "metrics": metrics,
+            "opinions": [
+                opinion.model_dump(exclude_none=True)
+                for opinion in revision.opinions
+            ],
+            "disputes": [
+                dispute.model_dump(exclude_none=True)
+                for dispute in revision.disputes
+            ],
+            "arbitrations": [
+                arbitration.model_dump(exclude_none=True)
+                for arbitration in revision.arbitrations
+            ],
+            "agent_calls": [
+                call.model_dump(exclude_none=True)
+                for call in revision.agent_calls
+            ],
+            "jobs": [
+                job.model_dump(exclude_none=True)
+                for job in revision.jobs
+            ],
+            "reviews": reviews,
             "pc_stage": project.stage,
             "claim_count": len(revision.claims),
             "evidence_packet_count": len(revision.evidence_packets),

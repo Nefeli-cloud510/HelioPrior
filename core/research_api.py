@@ -6,6 +6,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from core.research_repository import ResearchRepository, ResearchVersionConflictError
+from core.review_orchestrator import ResearchReviewError
 from core.research_service import ApiResult, ResearchApiError, ResearchService
 
 
@@ -15,8 +16,16 @@ RESEARCH_BASE = "/api/v2/research"
 class ResearchV2Api:
     """HTTP layer for the research-review API; no scientific logic lives here."""
 
-    def __init__(self, repository: ResearchRepository | None = None) -> None:
-        self.service = ResearchService(repository or ResearchRepository())
+    def __init__(
+        self,
+        repository: ResearchRepository | None = None,
+        *,
+        gateway: Any | None = None,
+    ) -> None:
+        self.service = ResearchService(
+            repository or ResearchRepository(),
+            gateway=gateway,
+        )
 
     def dispatch(
         self,
@@ -48,6 +57,20 @@ class ResearchV2Api:
                     raise ResearchApiError("v2 接口不存在。", status=404, code="route_not_found")
                 operation = operation_parts[0]
                 research_id = suffix.split("/")[0]
+                review_retry_match = re.fullmatch(
+                    rf"reviews/(?P<review_id>[^/]+)/retry",
+                    "/".join(operation_parts),
+                )
+                if review_retry_match and method == "POST":
+                    return self._with_request_id(
+                        request_id,
+                        self.service.retry_review(
+                            research_id=research_id,
+                            expected_revision=(payload or {}).get("expected_revision"),
+                            review_id=review_retry_match.group("review_id"),
+                            payload=payload or {},
+                        ),
+                    )
                 if operation == "artifacts" and method == "POST":
                     return self._with_request_id(
                         request_id,
@@ -66,6 +89,20 @@ class ResearchV2Api:
                             payload=payload or {},
                         ),
                     )
+                if operation == "reviews" and method == "POST":
+                    return self._with_request_id(
+                        request_id,
+                        self.service.start_review(
+                            research_id=research_id,
+                            expected_revision=(payload or {}).get("expected_revision"),
+                            payload=payload or {},
+                        ),
+                    )
+                if operation == "disputes" and method == "GET":
+                    return self._with_request_id(
+                        request_id,
+                        self.service.list_disputes(research_id),
+                    )
                 if operation in {
                     "artifacts",
                     "preflight",
@@ -74,8 +111,6 @@ class ResearchV2Api:
                     "approvals",
                     "executions",
                     "evidence",
-                    "reviews",
-                    "disputes",
                     "decisions",
                     "claims",
                     "jobs",
@@ -91,6 +126,15 @@ class ResearchV2Api:
             raise ResearchApiError("接口不存在。", status=404, code="route_not_found")
         except ResearchApiError as exc:
             return self._error_response(request_id, exc)
+        except ResearchReviewError as exc:
+            error = ResearchApiError(
+                exc.message,
+                status=exc.status,
+                code=exc.code,
+                retryable=exc.status >= 500,
+                details=exc.details,
+            )
+            return self._error_response(request_id, error)
         except ResearchVersionConflictError as exc:
             error = ResearchApiError(
                 str(exc),

@@ -13,6 +13,7 @@ DEFAULT_ROLE_MODELS = {
     "hypothesis_proposer": "",
     "scientific_questioner": "",
     "central_controller": "",
+    "central_arbitrator": "",
     "experiment_planner": "",
     "experiment_designer": "",
     "experiment_writer": "",

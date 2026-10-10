@@ -164,6 +164,7 @@ class EvidencePacket(ResearchBaseModel):
 
 class ReviewOpinion(ResearchBaseModel):
     opinion_id: str = Field(min_length=1)
+    review_id: str | None = None
     role: ReviewRole
     packet_hash: str = Field(min_length=1)
     claim_id: str | None = None
@@ -174,12 +175,14 @@ class ReviewOpinion(ResearchBaseModel):
     missing_evidence: list[str] = Field(default_factory=list)
     validation_proposals: list[str] = Field(default_factory=list)
     status: Literal["queued", "running", "completed", "failed", "partial"] = "queued"
+    is_stub: bool = False
     error_code: str | None = None
     error_message: str | None = None
 
 
 class Dispute(ResearchBaseModel):
     dispute_id: str = Field(min_length=1)
+    review_id: str | None = None
     claim_id: str | None = None
     question: str = Field(min_length=1)
     issue_code: str = "OPINION_CONFLICT"
@@ -188,6 +191,16 @@ class Dispute(ResearchBaseModel):
     evidence_ids: list[str] = Field(default_factory=list)
     status: DisputeStatus = "open"
     validation_ids: list[str] = Field(default_factory=list)
+
+
+class ArbitrationRecord(ResearchBaseModel):
+    arbitration_id: str = Field(min_length=1)
+    review_id: str | None = None
+    dispute_ids: list[str] = Field(default_factory=list)
+    issue_summary: str = Field(min_length=1)
+    recommended_action: str = Field(min_length=1)
+    required_validation: str | None = None
+    is_stub: bool = False
 
 
 class ValidationEstimate(ResearchBaseModel):
@@ -230,6 +243,7 @@ class AgentCallRecord(ResearchBaseModel):
     latency_ms: int | None = Field(default=None, ge=0)
     usage: dict[str, int] = Field(default_factory=dict)
     error_code: str | None = None
+    error_message: str | None = None
     cache_hit: bool = False
 
 
@@ -240,6 +254,7 @@ class JobRecord(ResearchBaseModel):
     stage: str = "queued"
     research_id: str = Field(min_length=1)
     request_hash: str | None = None
+    review_id: str | None = None
     error_code: str | None = None
     message: str | None = None
     result_ref: str | None = None
@@ -254,8 +269,8 @@ class ResearchRevision(ResearchBaseModel):
     evidence_packets: list[EvidencePacket] = Field(default_factory=list)
     opinions: list[ReviewOpinion] = Field(default_factory=list)
     disputes: list[Dispute] = Field(default_factory=list)
+    arbitrations: list[ArbitrationRecord] = Field(default_factory=list)
     candidates: list[ValidationCandidate] = Field(default_factory=list)
     decisions: list[ResearchDecision] = Field(default_factory=list)
     jobs: list[JobRecord] = Field(default_factory=list)
     agent_calls: list[AgentCallRecord] = Field(default_factory=list)
-
