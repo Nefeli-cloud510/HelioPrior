@@ -5138,6 +5138,22 @@ select {
   word-break: break-all;
 }
 
+.research-report-preview {
+  max-height: 420px;
+  overflow: auto;
+  margin: 10px 0 0;
+  padding: 14px 16px;
+  border: 1px solid rgba(138, 74, 33, 0.16);
+  border-radius: 8px;
+  background: rgba(255, 249, 237, 0.72);
+  color: rgba(74, 47, 24, 0.82);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 @media (max-width: 860px) {
   .research-page__header,
   .research-page__grid,

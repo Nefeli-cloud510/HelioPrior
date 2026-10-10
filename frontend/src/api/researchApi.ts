@@ -2,8 +2,12 @@ import { API_ROOT } from './liveWorkflow'
 import type {
   ArtifactKind,
   ArtifactRecord,
+  ClaimStatus,
+  ClaimVersionHistory,
   CreateResearchPayload,
   PreflightResult,
+  ResearchDecision,
+  ResearchReport,
   ResearchProjectDetail,
   ResearchProjectSummary,
   V2ApiEnvelope,
@@ -150,4 +154,73 @@ export async function runResearchPreflight(
     project: response.data,
     preflight: response.data.preflight,
   }
+}
+
+export async function listClaimVersions(
+  researchId: string,
+  claimId: string,
+): Promise<ClaimVersionHistory> {
+  const response = await v2Request<ClaimVersionHistory>(
+    `/research/${encodeURIComponent(researchId)}/claims/${encodeURIComponent(claimId)}/versions`,
+  )
+  if (!response.data) {
+    throw new ResearchApiError('结论版本数据为空。', 'empty_claim_versions', false)
+  }
+  return response.data
+}
+
+export interface CreateClaimVersionPayload {
+  statement?: string
+  evidence_ids?: string[]
+  status?: ClaimStatus
+  revision_note: string
+  scope?: {
+    sample_condition?: string
+    evaluation_period?: Record<string, string>
+    baseline_protocol_id?: string
+    horizon_days?: number
+  }
+  program_recommendation?: ClaimStatus
+  human_decision?: string
+  next_stage?: string
+}
+
+export async function createClaimVersion(
+  researchId: string,
+  expectedRevision: number,
+  claimId: string,
+  payload: CreateClaimVersionPayload,
+): Promise<{
+  project: ResearchProjectDetail
+  claimVersion: ClaimVersionHistory['versions'][number]
+  decision: ResearchDecision
+}> {
+  const response = await v2Request<
+    ResearchProjectDetail & {
+      claim_version: ClaimVersionHistory['versions'][number]
+      decision: ResearchDecision
+    }
+  >(`/research/${encodeURIComponent(researchId)}/claims/${encodeURIComponent(claimId)}/versions`, {
+    method: 'POST',
+    body: JSON.stringify({
+      expected_revision: expectedRevision,
+      ...payload,
+    }),
+  })
+  if (!response.data?.claim_version || !response.data?.decision) {
+    throw new ResearchApiError('结论版本保存后缺少版本或决定记录。', 'missing_claim_version', false)
+  }
+  return {
+    project: response.data,
+    claimVersion: response.data.claim_version,
+    decision: response.data.decision,
+  }
+}
+
+export async function exportResearchReport(researchId: string): Promise<ResearchReport> {
+  const response = await v2Request<ResearchReport>(`/research/${encodeURIComponent(researchId)}/report`)
+  if (!response.data) {
+    throw new ResearchApiError('研究报告数据为空。', 'empty_report', false)
+  }
+  return response.data
 }

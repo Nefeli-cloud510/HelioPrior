@@ -11,6 +11,7 @@ from core.protocol_bridge import ElasticNetDataSourceConfig
 from core.research_api import ResearchV2Api
 from core.research_repository import ResearchRepository
 from core.research_schema import Dispute
+from tests.test_research_api import ScriptedReviewGateway, opinion_for_packet
 
 
 def create_payload(
@@ -31,6 +32,14 @@ def create_payload(
         },
         "horizon_days": 3,
     }
+
+
+E2E_CSV = """forecast_origin,target_time,horizon_days,arm,y_true,y_pred,split
+2024-01-01,2024-01-04,3,base,-1.5,-1.3,train
+2024-01-01,2024-01-04,3,aug,-1.5,-1.6,train
+2024-01-02,2024-01-05,3,base,2.0,2.2,test
+2024-01-02,2024-01-05,3,aug,2.0,1.9,test
+"""
 
 
 DESIGN_HINTS = {
@@ -463,6 +472,171 @@ class ResearchValidationTest(unittest.TestCase):
         ]
         for path in harness_files:
             self.assertTrue(path.is_file(), f"harness 产物未落盘: {path}")
+
+    def test_full_review_version_and_report_loop(self) -> None:
+        """T6 收口：证据复核、批准执行、结论版本与报告必须串成同一条闭环。"""
+        gateway = ScriptedReviewGateway()
+        api = ResearchV2Api(
+            self.repository,
+            gateway=gateway,
+            data_source=self.data_source,
+            harness_project_root=self.root / "harness",
+        )
+        created = api.dispatch(
+            "POST",
+            "/api/v2/research",
+            {
+                **create_payload("端到端：结论版本化与报告导出"),
+                "entry_mode": "import_claim",
+                "claim_statement": "加入日影后，By 预测 RMSE 相比基准组改善",
+            },
+        )
+        self.assertEqual(created.status, 201)
+        research_id = created.payload["research_id"]
+        claim_id = created.payload["data"]["claims"][0]["claim_id"]
+
+        uploaded = api.dispatch(
+            "POST",
+            f"/api/v2/research/{research_id}/artifacts",
+            {
+                "expected_revision": created.payload["revision"],
+                "file_name": "paired_predictions.csv",
+                "kind": "prediction_csv",
+                "content": E2E_CSV,
+            },
+        )
+        self.assertEqual(uploaded.status, 201)
+        preflight = api.dispatch(
+            "POST",
+            f"/api/v2/research/{research_id}/preflight",
+            {
+                "expected_revision": uploaded.payload["data"]["revision"],
+                "artifact_id": uploaded.payload["data"]["artifact"]["artifact_id"],
+                "feature_columns": ["shadow_shift"],
+                "claim_ids": [claim_id],
+            },
+        )
+        self.assertEqual(preflight.status, 200)
+        packet = preflight.payload["data"]["preflight"]["packet"]
+
+        gateway.responses["scientific_questioner"] = opinion_for_packet(
+            packet,
+            claim_id,
+            "support",
+        )
+        gateway.responses["scientific_interpreter"] = opinion_for_packet(
+            packet,
+            claim_id,
+            "challenge",
+        )
+        gateway.responses["central_arbitrator"] = {
+            "issue_summary": "两路审读对增量证据判断直接相反。",
+            "recommended_action": "在相同样本上执行一次最小验证。",
+            "required_validation": "paired_replay",
+            "is_stub": False,
+        }
+        reviewed = api.dispatch(
+            "POST",
+            f"/api/v2/research/{research_id}/reviews",
+            {"expected_revision": preflight.payload["data"]["revision"]},
+        )
+        self.assertEqual(reviewed.status, 200)
+        dispute = reviewed.payload["data"]["review"]["disputes"][0]
+        self.assertEqual(dispute["issue_code"], "STANCE_CONFLICT")
+
+        gateway.responses["experiment_planner"] = {
+            "batch_id": "BATCH_E2E",
+            "candidates": [
+                scripted_candidate(
+                    "EXP_E2E",
+                    dispute_ids=[dispute["dispute_id"]],
+                )
+            ],
+        }
+        plan = self._plan(
+            api,
+            research_id,
+            reviewed.payload["data"]["revision"],
+            dispute_ids=[dispute["dispute_id"]],
+        )
+        candidate = self._candidate(plan)
+        approved = api.dispatch(
+            "POST",
+            f"/api/v2/research/{research_id}/approvals",
+            {
+                "expected_revision": plan.payload["revision"],
+                "protocol_hash": candidate["protocol_hash"],
+                "actor_type": "human_pi",
+                "rationale": "人工 PI 批准端到端验证。",
+            },
+        )
+        self.assertEqual(approved.status, 200)
+        executed = api.dispatch(
+            "POST",
+            f"/api/v2/research/{research_id}/executions",
+            {
+                "expected_revision": approved.payload["revision"],
+                "protocol_hash": candidate["protocol_hash"],
+            },
+        )
+        self.assertEqual(executed.status, 200)
+        self.assertEqual(
+            executed.payload["data"]["execution"]["job"]["status"],
+            "completed",
+        )
+
+        updated = api.dispatch(
+            "POST",
+            f"/api/v2/research/{research_id}/claims/{claim_id}/versions",
+            {
+                "expected_revision": executed.payload["data"]["revision"],
+                "statement": "在当前共同样本与 TS>=9 子条件下，日影增量证据仍不充分，需更多时段验证。",
+                "evidence_ids": [packet["packet_id"]],
+                "status": "insufficient",
+                "revision_note": "执行批内验证后按共同样本与质量条件重述结论；争议保持开放。",
+                "scope": {"sample_condition": "TS>=9"},
+                "human_decision": "人工 PI 决定保留结论但标记为证据不足。",
+            },
+        )
+        self.assertEqual(updated.status, 200)
+        self.assertEqual(updated.payload["data"]["claim_version"]["version"], 2)
+
+        report = api.dispatch(
+            "GET",
+            f"/api/v2/research/{research_id}/report",
+        )
+        self.assertEqual(report.status, 200)
+        payload = report.payload["data"]
+        self.assertEqual(len(payload["versions_by_claim"][claim_id]), 2)
+        self.assertTrue(payload["evidence_locators"])
+        self.assertTrue(
+            any(
+                job["kind"] == "validation_execution"
+                and job["status"] == "completed"
+                for job in payload["jobs"]
+            )
+        )
+        action_set = {decision["action"] for decision in payload["decisions"]}
+        self.assertIn("approve_protocol", action_set)
+        self.assertIn("execute_protocol", action_set)
+        self.assertIn("update_claim_version", action_set)
+
+        self.assertCountEqual(
+            gateway.calls,
+            [
+                "scientific_questioner",
+                "scientific_interpreter",
+                "central_arbitrator",
+                "experiment_planner",
+            ],
+            "完整闭环的主调用预算应控制在 4 次 LLM 请求",
+        )
+        self.assertEqual(payload["model_usage"]["total_calls"], len(payload["agent_calls"]))
+        self.assertEqual(payload["model_usage"]["roles"]["experiment_planner"]["total"], 1)
+        self.assertEqual(payload["model_usage"]["roles"]["validation_execution"]["total"], 1)
+        self.assertTrue(
+            (self.root / "harness" / "results" / "round_01" / "result_unified.json").is_file()
+        )
 
 
 if __name__ == "__main__":

@@ -142,10 +142,10 @@ class ResearchV2ApiTest(unittest.TestCase):
         detail = self.api.dispatch("GET", f"/api/v2/research/{research_id}")
         self.assertEqual(detail.payload["data"]["claim_count"], 1)
 
-    def test_later_endpoints_return_explicit_not_implemented(self) -> None:
+    def test_unsupported_claim_operations_return_explicit_not_implemented(self) -> None:
         created = self.api.dispatch("POST", "/api/v2/research", create_payload())
         research_id = created.payload["research_id"]
-        response = self.api.dispatch("POST", f"/api/v2/research/{research_id}/report", {"expected_revision": 1})
+        response = self.api.dispatch("POST", f"/api/v2/research/{research_id}/claims")
         self.assertEqual(response.status, 501)
         self.assertEqual(response.payload["code"], "not_implemented")
 
@@ -199,6 +199,127 @@ class ResearchV2ApiTest(unittest.TestCase):
         )
         self.assertEqual(response.status, 422)
         self.assertEqual(response.payload["code"], "artifact_required")
+
+    def test_claim_version_update_preserves_old_version(self) -> None:
+        research_id, claim_id, packet, revision = self._prepare_review_project(self.api)
+        listed = self.api.dispatch(
+            "GET",
+            f"/api/v2/research/{research_id}/claims/{claim_id}/versions",
+        )
+        self.assertEqual(listed.status, 200)
+        self.assertEqual(listed.payload["data"]["current_version"], 1)
+        self.assertEqual(listed.payload["data"]["version_count"], 1)
+
+        updated = self.api.dispatch(
+            "POST",
+            f"/api/v2/research/{research_id}/claims/{claim_id}/versions",
+            {
+                "expected_revision": listed.payload["revision"],
+                "statement": "在 TS>=9 且共同样本上，加入日影后 RMSE 相比基准组改善。",
+                "evidence_ids": [packet["packet_id"]],
+                "status": "supported_in_scope",
+                "revision_note": "根据证据包与双路复核结果缩窄适用范围，按共同样本口径重述。",
+                "scope": {"sample_condition": "TS>=9"},
+                "human_decision": "人工 PI 决定采纳受控范围结论。",
+                "next_stage": "validated",
+            },
+        )
+        self.assertEqual(updated.status, 200)
+        new_version = updated.payload["data"]["claim_version"]
+        self.assertEqual(new_version["version"], 2)
+        self.assertEqual(new_version["parent_version"], 1)
+        self.assertEqual(new_version["status"], "supported_in_scope")
+        self.assertEqual(new_version["evidence_ids"], [packet["packet_id"]])
+        self.assertEqual(new_version["scope"]["sample_condition"], "TS>=9")
+        self.assertTrue(new_version["decision_id"])
+        self.assertEqual(
+            updated.payload["data"]["decision"]["action"],
+            "update_claim_version",
+        )
+
+        after = self.api.dispatch(
+            "GET",
+            f"/api/v2/research/{research_id}/claims/{claim_id}/versions",
+        )
+        self.assertEqual(after.payload["data"]["current_version"], 2)
+        self.assertEqual(len(after.payload["data"]["versions"]), 2)
+        self.assertNotEqual(
+            after.payload["data"]["versions"][0]["statement"],
+            after.payload["data"]["versions"][1]["statement"],
+        )
+
+    def test_claim_version_validates_evidence_and_revision_note(self) -> None:
+        research_id, claim_id, packet, revision = self._prepare_review_project(self.api)
+        missing_note = self.api.dispatch(
+            "POST",
+            f"/api/v2/research/{research_id}/claims/{claim_id}/versions",
+            {
+                "expected_revision": revision,
+                "evidence_ids": [packet["packet_id"]],
+                "revision_note": "",
+            },
+        )
+        self.assertEqual(missing_note.status, 422)
+        self.assertEqual(missing_note.payload["code"], "revision_note_required")
+
+        unknown_evidence = self.api.dispatch(
+            "POST",
+            f"/api/v2/research/{research_id}/claims/{claim_id}/versions",
+            {
+                "expected_revision": revision,
+                "evidence_ids": ["EVP_NOT_EXISTS"],
+                "revision_note": "需要真实证据引用。",
+            },
+        )
+        self.assertEqual(unknown_evidence.status, 422)
+        self.assertEqual(unknown_evidence.payload["code"], "unknown_evidence_packet")
+
+    def test_export_report_contains_version_limitations_and_model_calls(self) -> None:
+        gateway = ScriptedReviewGateway()
+        api = ResearchV2Api(self.api.service.repository, gateway=gateway)
+        research_id, claim_id, packet, revision = self._prepare_review_project(api)
+        gateway.responses["scientific_questioner"] = opinion_for_packet(packet, claim_id, "support")
+        gateway.responses["scientific_interpreter"] = opinion_for_packet(packet, claim_id, "challenge")
+        gateway.responses["central_arbitrator"] = {
+            "issue_summary": "两路审读对增量证据判断直接相反。",
+            "recommended_action": "在相同样本上执行一次最小验证。",
+            "required_validation": "paired_replay",
+            "is_stub": False,
+        }
+        reviewed = api.dispatch(
+            "POST",
+            f"/api/v2/research/{research_id}/reviews",
+            {"expected_revision": revision},
+        )
+        self.assertEqual(reviewed.status, 200)
+
+        updated = api.dispatch(
+            "POST",
+            f"/api/v2/research/{research_id}/claims/{claim_id}/versions",
+            {
+                "expected_revision": reviewed.payload["data"]["revision"],
+                "evidence_ids": [packet["packet_id"]],
+                "revision_note": "保留争议状态，版本记录仅登记当前范围与证据。",
+                "scope": {"sample_condition": "TS>=9"},
+            },
+        )
+        self.assertEqual(updated.status, 200)
+
+        report = api.dispatch(
+            "GET",
+            f"/api/v2/research/{research_id}/report",
+        )
+        self.assertEqual(report.status, 200)
+        payload = report.payload["data"]
+        self.assertEqual(payload["report_kind"], "research_review_report")
+        self.assertEqual(len(payload["versions_by_claim"][claim_id]), 2)
+        self.assertEqual(payload["revision"], updated.payload["data"]["revision"])
+        self.assertIn("evidence_locators", payload)
+        self.assertTrue(payload["evidence_locators"])
+        self.assertEqual(payload["model_usage"]["total_calls"], len(payload["agent_calls"]))
+        self.assertGreaterEqual(payload["model_usage"]["total_calls"], 2)
+        self.assertIn("unresolved_issues", payload)
+        self.assertGreaterEqual(len(payload["unresolved_issues"]["open_disputes"]), 1)
 
     def _prepare_review_project(self, api: ResearchV2Api) -> tuple[str, str, dict, int]:
         created = api.dispatch(

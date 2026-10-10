@@ -137,6 +137,32 @@ class ResearchV2Api:
                             payload=payload or {},
                         ),
                     )
+                claim_versions_match = re.fullmatch(
+                    r"claims/(?P<claim_id>[^/]+)/versions",
+                    "/".join(operation_parts),
+                )
+                if claim_versions_match:
+                    claim_id = claim_versions_match.group("claim_id")
+                    if method == "GET":
+                        return self._with_request_id(
+                            request_id,
+                            self.service.list_claim_versions(research_id, claim_id),
+                        )
+                    if method == "POST":
+                        return self._with_request_id(
+                            request_id,
+                            self.service.create_claim_version(
+                                research_id=research_id,
+                                expected_revision=(payload or {}).get("expected_revision"),
+                                claim_id=claim_id,
+                                payload=payload or {},
+                            ),
+                        )
+                if operation == "report" and method == "GET":
+                    return self._with_request_id(
+                        request_id,
+                        self.service.export_report(research_id),
+                    )
                 if operation in {
                     "artifacts",
                     "preflight",

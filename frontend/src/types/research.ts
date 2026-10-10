@@ -61,6 +61,14 @@ export interface ResearchProjectDetail {
   evidence_packets: EvidencePacket[]
   checks: EvidenceCheck[]
   metrics: Record<string, MetricValue>
+  disputes?: ResearchDispute[]
+  arbitrations?: ResearchArbitration[]
+  candidates?: ValidationCandidate[]
+  decisions?: ResearchDecision[]
+  jobs?: JobRecord[]
+  agent_calls?: AgentCallRecord[]
+  opinions?: ReviewOpinion[]
+  protocols?: ProtocolSnapshot[]
   pc_stage: string
   claim_count: number
   evidence_packet_count: number
@@ -92,6 +100,189 @@ export interface ClaimVersion {
   revision_note?: string
   created_at: string
   updated_at: string
+}
+
+export interface ClaimVersionHistory {
+  claim_id: string
+  versions: ClaimVersion[]
+  current_version: number
+  version_count: number
+}
+
+export interface ResearchDispute {
+  dispute_id: string
+  review_id?: string
+  claim_id?: string
+  question: string
+  issue_code: string
+  scope?: Record<string, unknown>
+  opinion_ids?: string[]
+  evidence_ids?: string[]
+  status: string
+  validation_ids?: string[]
+}
+
+export interface ResearchArbitration {
+  arbitration_id: string
+  review_id?: string
+  dispute_ids?: string[]
+  issue_summary: string
+  recommended_action: string
+  required_validation?: string
+  is_stub?: boolean
+}
+
+export interface ValidationEstimate {
+  component: string
+  value?: number | null
+  unit?: string
+  calculation_version?: string
+  basis?: string
+}
+
+export interface ValidationCandidate {
+  experiment_id: string
+  dispute_ids?: string[]
+  hypothesis_ids?: string[]
+  template_id: string
+  round_id: number
+  design?: Record<string, unknown>
+  estimates?: ValidationEstimate[]
+  approval_required: boolean
+  status: string
+  protocol_hash?: string
+  utility_score?: number | null
+  source?: string
+  is_stub?: boolean
+  rationale?: string
+}
+
+export interface ResearchDecision {
+  decision_id: string
+  actor_type: string
+  action: string
+  rationale?: string
+  claim_version?: number
+  protocol_hash?: string
+  next_stage?: string
+}
+
+export interface JobRecord {
+  job_id: string
+  kind: string
+  status: string
+  stage: string
+  research_id: string
+  request_hash?: string
+  review_id?: string
+  error_code?: string
+  message?: string
+  result_ref?: string
+}
+
+export interface AgentCallRecord {
+  call_id: string
+  role: string
+  model_id: string
+  request_hash?: string
+  attempt: number
+  status: string
+  latency_ms?: number
+  usage?: Record<string, number>
+  error_code?: string
+  error_message?: string
+  cache_hit?: boolean
+}
+
+export interface ReviewOpinion {
+  opinion_id: string
+  review_id?: string
+  role: string
+  packet_hash: string
+  claim_id?: string
+  stance: string
+  observations?: string[]
+  evidence_refs?: string[]
+  metric_refs?: string[]
+  missing_evidence?: string[]
+  validation_proposals?: string[]
+  status: string
+  is_stub: boolean
+  error_code?: string
+  error_message?: string
+}
+
+export interface ProtocolSnapshot {
+  protocol_id: string
+  version: number
+  protocol_hash: string
+  target: ResearchTarget
+  time_spec?: Record<string, unknown>
+  sample_plan?: Record<string, unknown>
+  feature_arms?: Array<Record<string, unknown>>
+  split_plan?: Record<string, unknown>
+  method?: string
+  checks?: string[]
+}
+
+export interface EvidenceLocator {
+  evidence_id?: string
+  packet_id: string
+  packet_hash: string
+  artifact_id?: string
+  artifact_sha256?: string
+  locator?: string
+  value_type?: string
+  value?: number | string | null
+  unit?: string
+  provenance?: string
+  metric_key?: string
+  reason?: string
+}
+
+export interface UnresolvedIssueBucket {
+  open_disputes: ResearchDispute[]
+  unresolved_claims: ClaimVersion[]
+  packet_limitations: Array<{ packet_id: string; packet_hash: string; limitations: string[] }>
+  failed_jobs: JobRecord[]
+}
+
+export interface ModelUsageRecord {
+  total_calls: number
+  succeeded_calls: number
+  failed_calls: number
+  unfinished_calls: number
+  stub_opinions: number
+  stub_arbitrations: number
+  stub_candidates: number
+  roles: Record<string, { total: number; succeeded: number; failed: number }>
+}
+
+export interface ResearchReport {
+  report_kind: 'research_review_report'
+  schema_version: string
+  generated_at: string
+  research_id: string
+  revision: number
+  stage: string
+  project: ResearchProjectDetail['project']
+  claims: ClaimVersion[]
+  claim_versions: ClaimVersion[]
+  versions_by_claim: Record<string, ClaimVersion[]>
+  evidence_locators: Record<string, EvidenceLocator>
+  protocols: ProtocolSnapshot[]
+  artifacts: ArtifactRecord[]
+  evidence_packets: EvidencePacket[]
+  opinions: ReviewOpinion[]
+  disputes: ResearchDispute[]
+  arbitrations: ResearchArbitration[]
+  candidates: ValidationCandidate[]
+  decisions: ResearchDecision[]
+  jobs: JobRecord[]
+  agent_calls: AgentCallRecord[]
+  unresolved_issues: UnresolvedIssueBucket
+  model_usage: ModelUsageRecord
+  current_confirmed_versions: ClaimVersion[]
 }
 
 export interface ArtifactRecord {

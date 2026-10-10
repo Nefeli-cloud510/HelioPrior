@@ -30,9 +30,11 @@ from core.research_schema import (
     ArtifactKind,
     ArtifactRecord,
     ClaimScope,
+    ClaimStatus,
     ClaimVersion,
     EvidencePacket,
     ResearchProject,
+    ResearchDecision,
     ResearchRevision,
     ResearchTarget,
 )
@@ -787,6 +789,396 @@ class ResearchService:
                 continue
             return candidate
         return None
+
+    def list_claim_versions(
+        self,
+        research_id: str,
+        claim_id: str,
+    ) -> ApiResult:
+        try:
+            revision = self.repository.load_revision(research_id)
+        except ResearchProjectNotFoundError:
+            raise ResearchApiError("研究项目不存在。", status=404, code="project_not_found")
+        versions = [
+            claim
+            for claim in revision.claims
+            if claim.claim_id == claim_id
+        ]
+        if not versions:
+            raise ResearchApiError(
+                f"研究结论不存在：{claim_id}",
+                status=404,
+                code="claim_not_found",
+            )
+        return ApiResult(
+            status=200,
+            payload={
+                "research_id": research_id,
+                "revision": revision.revision,
+                "data": {
+                    "claim_id": claim_id,
+                    "versions": [
+                        version.model_dump(exclude_none=True)
+                        for version in versions
+                    ],
+                    "current_version": versions[-1].version,
+                    "version_count": len(versions),
+                },
+            },
+        )
+
+    def create_claim_version(
+        self,
+        research_id: str,
+        expected_revision: int,
+        claim_id: str,
+        payload: dict[str, Any],
+    ) -> ApiResult:
+        try:
+            current = self.repository.load_revision(research_id)
+        except ResearchProjectNotFoundError:
+            raise ResearchApiError("研究项目不存在。", status=404, code="project_not_found")
+        self._require_revision(current.revision, expected_revision)
+
+        versions = [
+            claim
+            for claim in current.claims
+            if claim.claim_id == claim_id
+        ]
+        if not versions:
+            raise ResearchApiError(
+                f"研究结论不存在：{claim_id}",
+                status=404,
+                code="claim_not_found",
+            )
+        current_version = versions[-1]
+
+        evidence_ids: list[str]
+        raw_evidence = payload.get("evidence_ids")
+        if raw_evidence is None:
+            evidence_ids = list(current_version.evidence_ids)
+        else:
+            if not isinstance(raw_evidence, (list, tuple)):
+                raise ResearchApiError(
+                    "evidence_ids 必须是字符串数组。",
+                    status=422,
+                    code="invalid_evidence_ids",
+                )
+            evidence_ids = [str(item) for item in raw_evidence]
+            packet_ids = {packet.packet_id for packet in current.evidence_packets}
+            unknown = [item for item in evidence_ids if item not in packet_ids]
+            if unknown:
+                raise ResearchApiError(
+                    f"证据包引用不存在：{', '.join(unknown)}",
+                    status=422,
+                    code="unknown_evidence_packet",
+                )
+
+        statement = payload.get("statement")
+        if statement is None:
+            statement = current_version.statement
+        else:
+            statement = str(statement).strip()
+            if not statement:
+                raise ResearchApiError(
+                    "statement 不能为空。",
+                    status=422,
+                    code="claim_statement_required",
+                )
+
+        revision_note = str(payload.get("revision_note") or "").strip()
+        if not revision_note:
+            raise ResearchApiError(
+                "revision_note 不能为空：结论版本必须说明修改理由。",
+                status=422,
+                code="revision_note_required",
+            )
+
+        raw_scope = payload.get("scope")
+        if raw_scope is None:
+            scope = current_version.scope.model_copy(deep=True)
+        else:
+            if not isinstance(raw_scope, dict):
+                raise ResearchApiError(
+                    "scope 必须是对象。",
+                    status=422,
+                    code="invalid_claim_scope",
+                )
+            scope_data = current_version.scope.model_dump(exclude_none=True)
+            scope_data.update(raw_scope)
+            try:
+                scope = ClaimScope.model_validate(scope_data)
+            except Exception as exc:
+                raise ResearchApiError(
+                    f"scope 字段不合法：{exc}",
+                    status=422,
+                    code="invalid_claim_scope",
+                ) from exc
+
+        raw_status = payload.get("status")
+        if raw_status is None:
+            status_value = current_version.status
+        else:
+            status_value = str(raw_status)
+            if status_value not in ClaimStatus.__args__:
+                raise ResearchApiError(
+                    f"status 不在白名单内：{status_value}",
+                    status=422,
+                    code="invalid_claim_status",
+                )
+
+        program_recommendation = payload.get("program_recommendation")
+        if program_recommendation is not None:
+            program_recommendation = str(program_recommendation)
+            if program_recommendation not in ClaimStatus.__args__:
+                raise ResearchApiError(
+                    f"program_recommendation 不在白名单内：{program_recommendation}",
+                    status=422,
+                    code="invalid_claim_status",
+                )
+
+        human_decision = payload.get("human_decision")
+        if human_decision is not None:
+            human_decision = str(human_decision).strip() or None
+        next_stage = payload.get("next_stage")
+        if next_stage is not None:
+            next_stage = str(next_stage).strip() or None
+
+        new_version_number = max(version.version for version in versions) + 1
+        decision = ResearchDecision(
+            decision_id="DEC_" + uuid.uuid4().hex[:12].upper(),
+            actor_type="human_pi",
+            action="update_claim_version",
+            rationale=revision_note,
+            claim_version=new_version_number,
+            protocol_hash=current_version.scope.baseline_protocol_id,
+            next_stage=next_stage,
+        )
+        new_version = ClaimVersion(
+            claim_id=claim_id,
+            version=new_version_number,
+            statement=statement,
+            scope=scope,
+            evidence_ids=evidence_ids,
+            status=status_value,
+            parent_version=current_version.version,
+            decision_id=decision.decision_id,
+            program_recommendation=program_recommendation,
+            human_decision=human_decision,
+            revision_note=revision_note,
+        )
+
+        def apply_version(state: ResearchRevision) -> None:
+            state.claims.append(new_version)
+            state.decisions.append(decision)
+            if next_stage:
+                state.project.stage = next_stage
+
+        next_state = self.repository.mutate(
+            research_id,
+            expected_revision=current.revision,
+            mutation=apply_version,
+        )
+        result = self._project_response(next_state, created=False)
+        result.payload["data"]["claim_version"] = new_version.model_dump(exclude_none=True)
+        result.payload["data"]["decision"] = decision.model_dump(exclude_none=True)
+        return result
+
+    def export_report(self, research_id: str) -> ApiResult:
+        try:
+            revision = self.repository.load_revision(research_id)
+        except ResearchProjectNotFoundError:
+            raise ResearchApiError("研究项目不存在。", status=404, code="project_not_found")
+
+        claim_versions_by_id: dict[str, list[ClaimVersion]] = {}
+        for claim in revision.claims:
+            claim_versions_by_id.setdefault(claim.claim_id, []).append(claim)
+        current_claims = [
+            claim_versions[-1]
+            for claim_versions in claim_versions_by_id.values()
+            if claim_versions
+        ]
+        evidence_locators: dict[str, dict[str, Any]] = {}
+        for packet in revision.evidence_packets:
+            for item in packet.evidence_items:
+                evidence_locators[item.evidence_id] = {
+                    "evidence_id": item.evidence_id,
+                    "packet_id": packet.packet_id,
+                    "packet_hash": packet.packet_hash,
+                    "artifact_id": item.artifact_id,
+                    "artifact_sha256": item.artifact_sha256,
+                    "locator": item.locator,
+                    "value_type": item.value_type,
+                    "value": item.value,
+                    "unit": item.unit,
+                    "provenance": item.provenance,
+                }
+            for metric_key, metric in packet.metrics.items():
+                if metric.metric_ref and metric.metric_ref not in evidence_locators:
+                    evidence_locators[metric.metric_ref] = {
+                        "metric_key": metric_key,
+                        "packet_id": packet.packet_id,
+                        "packet_hash": packet.packet_hash,
+                        "value": metric.value,
+                        "unit": metric.unit,
+                        "reason": metric.reason,
+                    }
+
+        unresolved_disputes = [
+            dispute
+            for dispute in revision.disputes
+            if dispute.status not in {"dismissed", "validated", "superseded"}
+        ]
+        unresolved_claims = [
+            claim
+            for claim in current_claims
+            if claim.status in {"unassessed", "insufficient", "mixed"}
+        ]
+        failed_jobs = [
+            job
+            for job in revision.jobs
+            if job.status in {"failed", "expired", "cancelled"}
+        ]
+        packet_limitations = [
+            {
+                "packet_id": packet.packet_id,
+                "packet_hash": packet.packet_hash,
+                "limitations": list(packet.limitations),
+            }
+            for packet in revision.evidence_packets
+            if packet.limitations
+        ]
+
+        agent_calls = [
+            call.model_dump(exclude_none=True)
+            for call in revision.agent_calls
+        ]
+        model_usage: dict[str, Any] = {
+            "total_calls": len(agent_calls),
+            "succeeded_calls": sum(
+                1 for call in agent_calls if call.get("status") == "succeeded"
+            ),
+            "failed_calls": sum(
+                1 for call in agent_calls if call.get("status") == "failed"
+            ),
+            "unfinished_calls": sum(
+                1
+                for call in agent_calls
+                if call.get("status") in {"queued", "running", "cancelled"}
+            ),
+            "stub_opinions": len(
+                [op for op in revision.opinions if op.is_stub]
+            ),
+            "stub_arbitrations": len(
+                [item for item in revision.arbitrations if item.is_stub]
+            ),
+            "stub_candidates": len(
+                [item for item in revision.candidates if item.is_stub]
+            ),
+            "roles": {},
+        }
+        for call in agent_calls:
+            role = str(call.get("role") or "other")
+            bucket = model_usage["roles"].setdefault(
+                role,
+                {"total": 0, "succeeded": 0, "failed": 0},
+            )
+            bucket["total"] += 1
+            if call.get("status") == "succeeded":
+                bucket["succeeded"] += 1
+            elif call.get("status") == "failed":
+                bucket["failed"] += 1
+
+        report_payload = {
+            "report_kind": "research_review_report",
+            "schema_version": SCHEMA_VERSION,
+            "generated_at": datetime.now().isoformat(),
+            "research_id": research_id,
+            "revision": revision.revision,
+            "stage": revision.project.stage,
+            "project": revision.project.model_dump(exclude_none=True),
+            "claims": [
+                claim.model_dump(exclude_none=True)
+                for claim in current_claims
+            ],
+            "claim_versions": [
+                claim.model_dump(exclude_none=True)
+                for claim in revision.claims
+            ],
+            "versions_by_claim": {
+                claim_id: [
+                    version.model_dump(exclude_none=True)
+                    for version in claim_versions
+                ]
+                for claim_id, claim_versions in claim_versions_by_id.items()
+            },
+            "evidence_locators": evidence_locators,
+            "protocols": [
+                protocol.model_dump(exclude_none=True)
+                for protocol in revision.protocols
+            ],
+            "artifacts": [
+                artifact.model_dump(exclude_none=True)
+                for artifact in revision.artifacts
+            ],
+            "evidence_packets": [
+                packet.model_dump(exclude_none=True)
+                for packet in revision.evidence_packets
+            ],
+            "opinions": [
+                opinion.model_dump(exclude_none=True)
+                for opinion in revision.opinions
+            ],
+            "disputes": [
+                dispute.model_dump(exclude_none=True)
+                for dispute in revision.disputes
+            ],
+            "arbitrations": [
+                arbitration.model_dump(exclude_none=True)
+                for arbitration in revision.arbitrations
+            ],
+            "candidates": [
+                candidate.model_dump(exclude_none=True)
+                for candidate in revision.candidates
+            ],
+            "decisions": [
+                decision.model_dump(exclude_none=True)
+                for decision in revision.decisions
+            ],
+            "jobs": [
+                job.model_dump(exclude_none=True)
+                for job in revision.jobs
+            ],
+            "agent_calls": agent_calls,
+            "unresolved_issues": {
+                "open_disputes": [
+                    dispute.model_dump(exclude_none=True)
+                    for dispute in unresolved_disputes
+                ],
+                "unresolved_claims": [
+                    claim.model_dump(exclude_none=True)
+                    for claim in unresolved_claims
+                ],
+                "packet_limitations": packet_limitations,
+                "failed_jobs": [
+                    job.model_dump(exclude_none=True)
+                    for job in failed_jobs
+                ],
+            },
+            "model_usage": model_usage,
+            "current_confirmed_versions": [
+                claim.model_dump(exclude_none=True)
+                for claim in current_claims
+            ],
+        }
+        return ApiResult(
+            status=200,
+            payload={
+                "research_id": research_id,
+                "revision": revision.revision,
+                "data": report_payload,
+            },
+        )
 
     def _validation_plan_response(
         self,

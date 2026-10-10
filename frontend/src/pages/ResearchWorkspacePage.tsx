@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import {
+  createClaimVersion,
+  exportResearchReport,
   createResearchProject,
   getResearchProject,
+  listClaimVersions,
   listResearchProjects,
   runResearchPreflight,
   uploadResearchArtifact,
@@ -10,6 +13,8 @@ import {
 import type {
   ArtifactKind,
   ArtifactRecord,
+  ClaimStatus,
+  ClaimVersionHistory,
   ClaimVersion,
   EvidenceCheck,
   EvidencePacket,
@@ -34,6 +39,15 @@ const CHECK_STATUS_LABELS: Record<string, string> = {
   fail: '未通过',
   unknown: '未知',
   not_applicable: '不适用',
+}
+
+const CLAIM_STATUS_LABELS: Record<string, string> = {
+  unassessed: '未评估',
+  insufficient: '证据不足',
+  supported_in_scope: '限定范围内支持',
+  not_supported_in_scope: '限定范围内不支持',
+  mixed: '结论混合',
+  retracted: '已撤回',
 }
 
 const targetPreview = (project: { target: ResearchProjectDetail['project']['target'] }) => {
@@ -366,6 +380,41 @@ function PacketMetrics({ packet }: { packet: EvidencePacket }) {
   )
 }
 
+function ClaimHistoryCard({ history }: { history: ClaimVersionHistory }) {
+  return (
+    <section className="detail-card" style={{ marginTop: 16 }}>
+      <div className="detail-card__title-row">
+        <h2>结论版本时间线：{history.claim_id}</h2>
+        <span className="badge">
+          v{history.current_version} / {history.version_count} 个版本
+        </span>
+      </div>
+      <ul className="research-material-list">
+        {history.versions.map((version) => (
+          <li key={`${version.claim_id}-${version.version}`} className="research-material-item">
+            <div className="research-check-item__top">
+              <strong>
+                v{version.version}
+                {version.parent_version ? `（由 v${version.parent_version} 修订）` : '（初始版本）'}
+              </strong>
+              <span className={`badge ${version.status === 'supported_in_scope' ? 'badge--success' : ''}`}>
+                {CLAIM_STATUS_LABELS[version.status] ?? version.status}
+              </span>
+            </div>
+            <p>{version.statement}</p>
+            <div className="detail-card__meta">
+              关联证据：{version.evidence_ids.join('、') || '暂无'}
+              {version.scope?.sample_condition ? ` · 样本条件：${version.scope.sample_condition}` : ''}
+              {version.revision_note ? ` · 修订说明：${version.revision_note}` : ''}
+              {version.human_decision ? ` · 人工决定：${version.human_decision}` : ''}
+            </div>
+          </li>
+        ))}
+      </ul>
+    </section>
+  )
+}
+
 export function ResearchWorkspacePage() {
   const { researchId } = useParams<{ researchId?: string }>()
   if (!researchId) {
@@ -394,6 +443,23 @@ function ResearchProjectDetailView({ researchId }: { researchId: string }) {
   const [actionError, setActionError] = useState<string | null>(null)
   const [actionNotice, setActionNotice] = useState<string | null>(null)
   const [preflightResult, setPreflightResult] = useState<PreflightResult | null>(null)
+  const [claimHistory, setClaimHistory] = useState<ClaimVersionHistory | null>(null)
+  const [historyClaimId, setHistoryClaimId] = useState('')
+  const [historyBusy, setHistoryBusy] = useState(false)
+  const [versionForm, setVersionForm] = useState({
+    claimId: '',
+    loadedClaimId: '',
+    statement: '',
+    sampleCondition: '',
+    status: 'unassessed' as ClaimStatus,
+    evidenceIds: '',
+    revisionNote: '',
+    humanDecision: '',
+    nextStage: '',
+  })
+  const [versionBusy, setVersionBusy] = useState(false)
+  const [reportBusy, setReportBusy] = useState(false)
+  const [reportText, setReportText] = useState<string | null>(null)
 
   async function refresh() {
     try {
@@ -410,6 +476,38 @@ function ResearchProjectDetailView({ researchId }: { researchId: string }) {
   useEffect(() => {
     void refresh()
   }, [researchId])
+
+  useEffect(() => {
+    if (!project || project.claims.length === 0) {
+      setVersionForm((prev) => ({ ...prev, claimId: '', loadedClaimId: '' }))
+      return
+    }
+    setVersionForm((prev) => ({
+      ...prev,
+      claimId: prev.claimId || project.claims[0].claim_id,
+    }))
+  }, [project?.claims])
+
+  useEffect(() => {
+    const claim = project?.claims.find((item) => item.claim_id === versionForm.claimId)
+    if (!claim) {
+      return
+    }
+    if (versionForm.loadedClaimId === claim.claim_id) {
+      return
+    }
+    setVersionForm((prev) => ({
+      ...prev,
+      loadedClaimId: claim.claim_id,
+      statement: claim.statement,
+      sampleCondition: claim.scope?.sample_condition ?? '',
+      status: claim.status,
+      evidenceIds: claim.evidence_ids.join(', '),
+      revisionNote: '',
+      humanDecision: '',
+      nextStage: '',
+    }))
+  }, [versionForm.claimId, project?.claims])
 
   const latestArtifact = useMemo(() => {
     const list = project?.artifacts ?? []
@@ -499,6 +597,93 @@ function ResearchProjectDetailView({ researchId }: { researchId: string }) {
     } finally {
       setPreflightBusy(false)
     }
+  }
+
+  async function openClaimHistory() {
+    if (!historyClaimId.trim()) {
+      setActionError('请先选择要查看版本的结论。')
+      return
+    }
+    try {
+      setHistoryBusy(true)
+      setActionError(null)
+      const history = await listClaimVersions(researchId, historyClaimId.trim())
+      setClaimHistory(history)
+    } catch (caught) {
+      setActionError(caught instanceof Error ? caught.message : '结论版本读取失败。')
+    } finally {
+      setHistoryBusy(false)
+    }
+  }
+
+  async function saveClaimVersion() {
+    if (!project) {
+      return
+    }
+    const claimId = versionForm.claimId.trim()
+    if (!claimId) {
+      setActionError('请选择需要更新版本的结论。')
+      return
+    }
+    if (!versionForm.revisionNote.trim()) {
+      setActionError('版本说明不能为空：每次修改都必须说明理由。')
+      return
+    }
+    const evidenceIds = versionForm.evidenceIds
+      .split(/[,，]/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+    try {
+      setVersionBusy(true)
+      setActionError(null)
+      setActionNotice(null)
+      setClaimHistory(null)
+      const result = await createClaimVersion(researchId, project.revision, claimId, {
+        statement: versionForm.statement.trim() || undefined,
+        evidence_ids: evidenceIds.length > 0 ? evidenceIds : undefined,
+        status: versionForm.status,
+        revision_note: versionForm.revisionNote.trim(),
+        scope: {
+          sample_condition: versionForm.sampleCondition.trim() || undefined,
+        },
+        human_decision: versionForm.humanDecision.trim() || undefined,
+        next_stage: versionForm.nextStage.trim() || undefined,
+      })
+      setProject(result.project)
+      setActionNotice(
+        `结论 ${claimId} 已保存为 v${result.claimVersion.version}，旧版本仍保留。决定 ${result.decision.decision_id} 已登记。`,
+      )
+    } catch (caught) {
+      setActionError(caught instanceof Error ? caught.message : '结论版本保存失败。')
+    } finally {
+      setVersionBusy(false)
+    }
+  }
+
+  async function exportReport() {
+    try {
+      setReportBusy(true)
+      setActionError(null)
+      const report = await exportResearchReport(researchId)
+      setReportText(JSON.stringify(report, null, 2))
+    } catch (caught) {
+      setActionError(caught instanceof Error ? caught.message : '研究报告导出失败。')
+    } finally {
+      setReportBusy(false)
+    }
+  }
+
+  function downloadReport() {
+    if (!reportText) {
+      return
+    }
+    const blob = new Blob([reportText], { type: 'application/json;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `helioprior-report-${researchId}-rev${project?.revision ?? 0}.json`
+    anchor.click()
+    URL.revokeObjectURL(url)
   }
 
   if (loading && !project) {
@@ -775,6 +960,174 @@ function ResearchProjectDetailView({ researchId }: { researchId: string }) {
               <div className="research-empty">暂无证据包。导入预测 CSV 并完成预检后会在此显示真实指标。</div>
             )}
           </section>
+
+          <section className="detail-card" style={{ marginTop: 18 }}>
+            <div className="detail-card__title-row">
+              <h2>结论版本与报告</h2>
+              <span className="badge">人工决定</span>
+            </div>
+            <p className="detail-card__meta">
+              每次保存结论都会生成不可变的新版本并登记人工决定；旧版本、证据引用和决定记录始终保留。
+            </p>
+            <div className="research-form-grid">
+              <div className="research-field">
+                <label htmlFor="claim-version-claim">结论</label>
+                <select
+                  id="claim-version-claim"
+                  value={versionForm.claimId}
+                  onChange={(event) => {
+                    const claimId = event.target.value
+                    setVersionForm((prev) => ({
+                      ...prev,
+                      claimId,
+                      loadedClaimId: '',
+                      revisionNote: '',
+                    }))
+                  }}
+                >
+                  {project.claims.length > 0 ? (
+                    project.claims.map((claim) => (
+                      <option key={claim.claim_id} value={claim.claim_id}>
+                        {claim.claim_id} · v{claim.version} · {claim.statement.slice(0, 28)}
+                      </option>
+                    ))
+                  ) : (
+                    <option value="">（暂无结论）</option>
+                  )}
+                </select>
+              </div>
+              <div className="research-field">
+                <label htmlFor="claim-version-status">状态</label>
+                <select
+                  id="claim-version-status"
+                  value={versionForm.status}
+                  onChange={(event) =>
+                    setVersionForm((prev) => ({ ...prev, status: event.target.value as ClaimStatus }))
+                  }
+                >
+                  {(Object.keys(CLAIM_STATUS_LABELS) as ClaimStatus[]).map((status) => (
+                    <option key={status} value={status}>
+                      {CLAIM_STATUS_LABELS[status]}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="research-field research-field--wide">
+                <label htmlFor="claim-version-statement">结论表述</label>
+                <textarea
+                  id="claim-version-statement"
+                  value={versionForm.statement}
+                  onChange={(event) =>
+                    setVersionForm((prev) => ({ ...prev, statement: event.target.value }))
+                  }
+                />
+              </div>
+              <div className="research-field">
+                <label htmlFor="claim-version-sample">样本条件</label>
+                <input
+                  id="claim-version-sample"
+                  value={versionForm.sampleCondition}
+                  onChange={(event) =>
+                    setVersionForm((prev) => ({ ...prev, sampleCondition: event.target.value }))
+                  }
+                  placeholder="例如 TS>=9"
+                />
+              </div>
+              <div className="research-field">
+                <label htmlFor="claim-version-evidence">证据包引用（逗号分隔）</label>
+                <input
+                  id="claim-version-evidence"
+                  value={versionForm.evidenceIds}
+                  onChange={(event) =>
+                    setVersionForm((prev) => ({ ...prev, evidenceIds: event.target.value }))
+                  }
+                  placeholder="EVP_..."
+                />
+              </div>
+              <div className="research-field research-field--wide">
+                <label htmlFor="claim-version-note">版本说明（必填）</label>
+                <textarea
+                  id="claim-version-note"
+                  value={versionForm.revisionNote}
+                  onChange={(event) =>
+                    setVersionForm((prev) => ({ ...prev, revisionNote: event.target.value }))
+                  }
+                  placeholder="说明为什么修改结论：引用了哪份证据、改变了哪个适用范围。"
+                />
+              </div>
+              <div className="research-field research-field--wide">
+                <label htmlFor="claim-version-human">人工 PI 决定</label>
+                <input
+                  id="claim-version-human"
+                  value={versionForm.humanDecision}
+                  onChange={(event) =>
+                    setVersionForm((prev) => ({ ...prev, humanDecision: event.target.value }))
+                  }
+                  placeholder="例如：采纳限定范围结论，进入下一轮验证"
+                />
+              </div>
+              <div className="research-field">
+                <label htmlFor="claim-version-stage">下一阶段</label>
+                <input
+                  id="claim-version-stage"
+                  value={versionForm.nextStage}
+                  onChange={(event) =>
+                    setVersionForm((prev) => ({ ...prev, nextStage: event.target.value }))
+                  }
+                  placeholder="例如 validated"
+                />
+              </div>
+            </div>
+            <div className="research-actions">
+              <button
+                className="research-primary"
+                type="button"
+                disabled={versionBusy}
+                onClick={() => void saveClaimVersion()}
+              >
+                {versionBusy ? '保存中……' : '保存新结论版本'}
+              </button>
+              <button
+                className="research-secondary"
+                type="button"
+                disabled={historyBusy || !historyClaimId.trim()}
+                onClick={() => void openClaimHistory()}
+              >
+                {historyBusy ? '读取中……' : '查看版本历史'}
+              </button>
+              <input
+                aria-label="版本历史结论标识"
+                value={historyClaimId}
+                placeholder="输入结论 ID 查看历史"
+                onChange={(event) => setHistoryClaimId(event.target.value)}
+              />
+              <button
+                className="research-primary"
+                type="button"
+                disabled={reportBusy}
+                onClick={() => void exportReport()}
+              >
+                {reportBusy ? '导出中……' : '生成研究报告'}
+              </button>
+              {reportText ? (
+                <button className="research-secondary" type="button" onClick={downloadReport}>
+                  下载 JSON
+                </button>
+              ) : null}
+            </div>
+          </section>
+
+          {reportText ? (
+            <section className="detail-card" style={{ marginTop: 16 }}>
+              <div className="detail-card__title-row">
+                <h2>报告预览</h2>
+                <span className="badge">research_review_report</span>
+              </div>
+              <pre className="research-report-preview">{reportText}</pre>
+            </section>
+          ) : null}
+
+          {claimHistory ? <ClaimHistoryCard history={claimHistory} /> : null}
         </main>
       </div>
     </div>
