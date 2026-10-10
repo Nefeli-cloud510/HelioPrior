@@ -1,6 +1,9 @@
 import { API_ROOT } from './liveWorkflow'
 import type {
+  ArtifactKind,
+  ArtifactRecord,
   CreateResearchPayload,
+  PreflightResult,
   ResearchProjectDetail,
   ResearchProjectSummary,
   V2ApiEnvelope,
@@ -80,4 +83,71 @@ export async function getResearchProject(researchId: string): Promise<ResearchPr
     throw new ResearchApiError('研究项目数据为空。', 'empty_project', false)
   }
   return response.data
+}
+
+export interface UploadResearchArtifactPayload {
+  file_name: string
+  kind: ArtifactKind
+  content: string
+  content_type?: string
+}
+
+export async function uploadResearchArtifact(
+  researchId: string,
+  expectedRevision: number,
+  payload: UploadResearchArtifactPayload,
+): Promise<{ project: ResearchProjectDetail; artifact: ArtifactRecord }> {
+  const response = await v2Request<ResearchProjectDetail & { artifact: ArtifactRecord }>(
+    `/research/${encodeURIComponent(researchId)}/artifacts`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_revision: expectedRevision,
+        ...payload,
+      }),
+    },
+  )
+  if (!response.data?.artifact) {
+    throw new ResearchApiError('产物导入后未返回文件记录。', 'missing_artifact', false)
+  }
+  return {
+    project: response.data,
+    artifact: response.data.artifact,
+  }
+}
+
+export interface RunResearchPreflightPayload {
+  artifact_id?: string
+  feature_columns?: string[]
+  claim_ids?: string[]
+  protocol_hash_value?: string
+  data_manifest_hash?: string
+  run_id?: string
+  horizon_days?: number
+  base_arm?: string
+  aug_arm?: string
+}
+
+export async function runResearchPreflight(
+  researchId: string,
+  expectedRevision: number,
+  payload: RunResearchPreflightPayload,
+): Promise<{ project: ResearchProjectDetail; preflight: PreflightResult }> {
+  const response = await v2Request<ResearchProjectDetail & { preflight: PreflightResult }>(
+    `/research/${encodeURIComponent(researchId)}/preflight`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_revision: expectedRevision,
+        ...payload,
+      }),
+    },
+  )
+  if (!response.data?.preflight) {
+    throw new ResearchApiError('预检未返回证据包结果。', 'missing_preflight', false)
+  }
+  return {
+    project: response.data,
+    preflight: response.data.preflight,
+  }
 }

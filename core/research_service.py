@@ -1,18 +1,28 @@
 from __future__ import annotations
 
+import hashlib
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from core.evidence_builder import (
+    build_evidence_packet,
+    normalize_prediction_rows,
+    parse_source_content,
+    summarize_preflight,
+)
 from core.research_repository import (
     ResearchProjectNotFoundError,
     ResearchRepository,
 )
 from core.research_schema import (
     SCHEMA_VERSION,
+    ArtifactKind,
+    ArtifactRecord,
     ClaimScope,
     ClaimVersion,
+    EvidencePacket,
     ResearchProject,
     ResearchRevision,
     ResearchTarget,
@@ -112,6 +122,251 @@ class ResearchService:
         except ResearchProjectNotFoundError:
             raise ResearchApiError("研究项目不存在。", status=404, code="project_not_found")
         return self._project_response(revision, created=False)
+
+    def import_artifact(
+        self,
+        research_id: str,
+        expected_revision: int,
+        payload: dict[str, Any],
+    ) -> ApiResult:
+        try:
+            current = self.repository.load_revision(research_id)
+        except ResearchProjectNotFoundError:
+            raise ResearchApiError("研究项目不存在。", status=404, code="project_not_found")
+        try:
+            expected = int(expected_revision)
+        except (TypeError, ValueError):
+            raise ResearchApiError(
+                "expected_revision 必须是整数。",
+                status=422,
+                code="invalid_revision",
+            )
+        if current.revision != expected:
+            raise ResearchApiError(
+                f"版本冲突：当前 revision={current.revision}。",
+                status=409,
+                code="revision_conflict",
+                retryable=True,
+            )
+
+        file_name = str(payload.get("file_name") or "").strip()
+        content = payload.get("content")
+        if not file_name:
+            raise ResearchApiError("file_name 不能为空。", status=422, code="missing_required_field")
+        if content is None:
+            raise ResearchApiError("content 不能为空。", status=422, code="missing_required_field")
+        if isinstance(content, str):
+            if len(content) > 20_000_000:
+                raise ResearchApiError(
+                    "导入产物过大，单文件上限为 20MB。",
+                    status=422,
+                    code="artifact_too_large",
+                )
+        elif not isinstance(content, (bytes, bytearray)):
+            raise ResearchApiError(
+                "content 必须是字符串或字节。",
+                status=422,
+                code="invalid_artifact_content",
+            )
+
+        kind = str(payload.get("kind") or "prediction_csv").lower()
+        allowed_kinds = set(ArtifactKind.__args__)
+        if kind not in allowed_kinds:
+            raise ResearchApiError(
+                f"artifact kind 不在白名单内：{kind}",
+                status=422,
+                code="invalid_artifact_kind",
+            )
+
+        text_content = content.decode("utf-8", errors="replace") if isinstance(content, (bytes, bytearray)) else content
+        parsed_source = parse_source_content(kind, text_content, file_name)
+        parsed = normalize_prediction_rows(parsed_source)
+        artifact_id = "ART_" + uuid.uuid4().hex[:12].upper()
+        stored_path = self.repository.store_artifact(research_id, artifact_id, text_content)
+        now = datetime.now()
+        artifact = ArtifactRecord(
+            artifact_id=artifact_id,
+            file_name=file_name,
+            sha256=hashlib.sha256(text_content.encode("utf-8")).hexdigest(),
+            size_bytes=len(text_content.encode("utf-8")),
+            kind=kind,
+            stored_path=str(stored_path),
+            content_type=payload.get("content_type"),
+            parsed=not bool(parsed_source.parse_errors),
+            parse_errors=list(parsed_source.parse_errors),
+            created_at=now,
+            updated_at=now,
+            source_kind="research_service",
+            schema_version=SCHEMA_VERSION,
+        )
+
+        def apply_artifact(state: ResearchRevision) -> None:
+            state.artifacts.append(artifact)
+
+        next_state = self.repository.mutate(
+            research_id,
+            expected_revision=expected,
+            mutation=apply_artifact,
+        )
+        result = self._project_response(next_state, created=False)
+        result.payload["data"]["artifact"] = artifact.model_dump(exclude_none=True)
+        return ApiResult(status=201, payload=result.payload)
+
+    def preflight(
+        self,
+        research_id: str,
+        expected_revision: int,
+        payload: dict[str, Any],
+    ) -> ApiResult:
+        try:
+            current = self.repository.load_revision(research_id)
+        except ResearchProjectNotFoundError:
+            raise ResearchApiError("研究项目不存在。", status=404, code="project_not_found")
+        try:
+            expected = int(expected_revision)
+        except (TypeError, ValueError):
+            raise ResearchApiError(
+                "expected_revision 必须是整数。",
+                status=422,
+                code="invalid_revision",
+            )
+        if current.revision != expected:
+            raise ResearchApiError(
+                f"版本冲突：当前 revision={current.revision}。",
+                status=409,
+                code="revision_conflict",
+                retryable=True,
+            )
+
+        artifact_id = str(payload.get("artifact_id") or "").strip()
+        artifact = next(
+            (item for item in current.artifacts if item.artifact_id == artifact_id),
+            None,
+        )
+        if artifact is None:
+            artifact = next(
+                (item for item in reversed(current.artifacts) if item.kind == "prediction_csv"),
+                None,
+            )
+        if artifact is None:
+            raise ResearchApiError(
+                "预检需要至少一条已导入产物。",
+                status=422,
+                code="artifact_required",
+            )
+
+        try:
+            content = self.repository.read_artifact(research_id, artifact.artifact_id)
+        except ResearchProjectNotFoundError:
+            raise ResearchApiError(
+                "产物文件不可读，请重新上传。",
+                status=410,
+                code="artifact_storage_missing",
+            )
+        text_content = content.decode("utf-8", errors="replace")
+        parsed_source = parse_source_content(artifact.kind, text_content, artifact.file_name)
+        parsed = normalize_prediction_rows(
+            parsed_source,
+            target_column=(payload.get("parse_options") or {}).get("target_column"),
+        )
+
+        project = current.project
+        claim_ids = payload.get("claim_ids") or []
+        claim_ids = [str(item) for item in claim_ids]
+        existing_claim_ids = {claim.claim_id for claim in current.claims}
+        unknown_claim_ids = [claim_id for claim_id in claim_ids if claim_id not in existing_claim_ids]
+        if unknown_claim_ids:
+            raise ResearchApiError(
+                f"claim_ids 包含不存在的研究结论：{', '.join(unknown_claim_ids)}",
+                status=422,
+                code="invalid_claim_ids",
+            )
+        if not claim_ids and current.claims:
+            claim_ids = [current.claims[0].claim_id]
+
+        protocol_hash_value = payload.get("protocol_hash_value")
+        if not protocol_hash_value and current.protocols:
+            protocol_hash_value = current.protocols[-1].protocol_hash
+        data_manifest_hash = payload.get("data_manifest_hash")
+        feature_columns = payload.get("feature_columns")
+        if feature_columns is not None and not isinstance(feature_columns, list):
+            raise ResearchApiError(
+                "feature_columns 必须是字符串数组。",
+                status=422,
+                code="invalid_feature_columns",
+            )
+        horizon_days = payload.get("horizon_days")
+        if horizon_days is None:
+            horizon_days = project.horizon_days
+        try:
+            horizon_days = int(horizon_days)
+        except (TypeError, ValueError):
+            raise ResearchApiError(
+                "horizon_days 必须是整数。",
+                status=422,
+                code="invalid_horizon",
+            )
+
+        packet = build_evidence_packet(
+            parsed=parsed,
+            protocol_hash_value=str(protocol_hash_value) if protocol_hash_value else None,
+            data_manifest_hash=data_manifest_hash,
+            run_id=payload.get("run_id"),
+            claim_ids=claim_ids,
+            target_id=str(payload.get("target_id") or project.target.id),
+            unit=project.target.unit,
+            horizon_days=horizon_days,
+            feature_columns=feature_columns,
+            base_arm=payload.get("base_arm"),
+            aug_arm=payload.get("aug_arm"),
+            primary_artifact_id=artifact.artifact_id,
+            primary_artifact_sha256=artifact.sha256,
+            imported_metrics=parsed_source.imported_metrics,
+        )
+        if not packet.packet_id:
+            packet.packet_id = f"EVP_{packet.packet_hash[:12]}"
+
+        blocking_issues = [
+            {
+                "code": check.code,
+                "status": check.status,
+                "detail": check.detail,
+                "reason": check.reason,
+            }
+            for check in packet.checks
+            if check.blocking and check.status != "pass"
+        ]
+        if parsed_source.parse_errors or parsed.missing_columns:
+            preflight_status = "needs_input"
+            stage = "needs_input"
+        elif blocking_issues:
+            preflight_status = "needs_input"
+            stage = "needs_input"
+        else:
+            preflight_status = "ready"
+            stage = "evidence_ready"
+
+        def apply_packet(state: ResearchRevision) -> None:
+            state.evidence_packets.append(packet)
+            for claim in state.claims:
+                if claim.claim_id in claim_ids and packet.packet_id not in claim.evidence_ids:
+                    claim.evidence_ids.append(packet.packet_id)
+            state.project.stage = stage
+
+        next_state = self.repository.mutate(
+            research_id,
+            expected_revision=expected,
+            mutation=apply_packet,
+        )
+        result = self._project_response(next_state, created=False)
+        result.payload["data"]["pc_stage"] = next_state.project.stage
+        result.payload["data"]["preflight"] = {
+            "status": preflight_status,
+            "packet": packet.model_dump(exclude_none=True),
+            "summary": summarize_preflight(parsed, str(protocol_hash_value) if protocol_hash_value else None),
+            "blocking_issues": blocking_issues,
+        }
+        return ApiResult(status=200, payload=result.payload)
 
     def _build_project(
         self,
@@ -221,9 +476,37 @@ class ResearchService:
 
     def _project_response(self, revision: ResearchRevision, *, created: bool) -> ApiResult:
         project = revision.project
+        claims = [claim.model_dump(exclude_none=True) for claim in revision.claims]
+        artifacts = [artifact.model_dump(exclude_none=True) for artifact in revision.artifacts]
+        evidence_packets = [
+            packet.model_dump(exclude_none=True)
+            for packet in revision.evidence_packets
+        ]
+        checks = [
+            {
+                **check.model_dump(exclude_none=True),
+                "packet_id": packet.packet_id,
+            }
+            for packet in revision.evidence_packets
+            for check in packet.checks
+        ]
+        metrics = {
+            f"{packet.packet_id}#{key}": {
+                **metric.model_dump(exclude_none=True),
+                "packet_id": packet.packet_id,
+            }
+            for packet in revision.evidence_packets
+            for key, metric in packet.metrics.items()
+        }
         data = {
             "project": project.model_dump(exclude_none=True),
             "revision": revision.revision,
+            "claims": claims,
+            "artifacts": artifacts,
+            "evidence_packets": evidence_packets,
+            "checks": checks,
+            "metrics": metrics,
+            "pc_stage": project.stage,
             "claim_count": len(revision.claims),
             "evidence_packet_count": len(revision.evidence_packets),
             "open_dispute_count": len(

@@ -44,7 +44,29 @@ class ResearchV2Api:
             if normalized_path.startswith(f"{RESEARCH_BASE}/"):
                 suffix = normalized_path[len(RESEARCH_BASE) + 1 :]
                 operation_parts = suffix.split("/")[1:]
-                if operation_parts and operation_parts[0] in {
+                if not operation_parts:
+                    raise ResearchApiError("v2 接口不存在。", status=404, code="route_not_found")
+                operation = operation_parts[0]
+                research_id = suffix.split("/")[0]
+                if operation == "artifacts" and method == "POST":
+                    return self._with_request_id(
+                        request_id,
+                        self.service.import_artifact(
+                            research_id=research_id,
+                            expected_revision=(payload or {}).get("expected_revision"),
+                            payload=payload or {},
+                        ),
+                    )
+                if operation == "preflight" and method == "POST":
+                    return self._with_request_id(
+                        request_id,
+                        self.service.preflight(
+                            research_id=research_id,
+                            expected_revision=(payload or {}).get("expected_revision"),
+                            payload=payload or {},
+                        ),
+                    )
+                if operation in {
                     "artifacts",
                     "preflight",
                     "hypotheses",

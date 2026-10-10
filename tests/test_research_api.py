@@ -85,6 +85,57 @@ class ResearchV2ApiTest(unittest.TestCase):
         self.assertEqual(response.status, 501)
         self.assertEqual(response.payload["code"], "not_implemented")
 
+    def test_upload_artifact_and_preflight_build_evidence_packet(self) -> None:
+        created = self.api.dispatch("POST", "/api/v2/research", create_payload())
+        research_id = created.payload["research_id"]
+        csv = """forecast_origin,target_time,horizon_days,arm,y_true,y_pred,split
+2024-01-01,2024-01-04,3,base,-1.5,-1.3,train
+2024-01-01,2024-01-04,3,aug,-1.5,-1.6,train
+2024-01-02,2024-01-05,3,base,2.0,2.2,test
+2024-01-02,2024-01-05,3,aug,2.0,1.9,test
+"""
+        uploaded = self.api.dispatch(
+            "POST",
+            f"/api/v2/research/{research_id}/artifacts",
+            {
+                "expected_revision": 1,
+                "file_name": "paired_predictions.csv",
+                "kind": "prediction_csv",
+                "content": csv,
+            },
+        )
+        self.assertEqual(uploaded.status, 201)
+        artifact = uploaded.payload["data"]["artifact"]
+        self.assertTrue(artifact["parsed"])
+        self.assertTrue(artifact["sha256"])
+
+        preflighted = self.api.dispatch(
+            "POST",
+            f"/api/v2/research/{research_id}/preflight",
+            {
+                "expected_revision": 2,
+                "artifact_id": artifact["artifact_id"],
+                "feature_columns": ["shadow_shift"],
+            },
+        )
+        self.assertEqual(preflighted.status, 200)
+        preflight = preflighted.payload["data"]["preflight"]
+        packet = preflight["packet"]
+        self.assertTrue(packet["packet_id"])
+        self.assertAlmostEqual(packet["metrics"]["gain_rmse"]["value"], 0.1, places=6)
+        self.assertEqual(preflighted.payload["data"]["evidence_packet_count"], 1)
+
+    def test_preflight_without_artifact_returns_actionable_error(self) -> None:
+        created = self.api.dispatch("POST", "/api/v2/research", create_payload())
+        research_id = created.payload["research_id"]
+        response = self.api.dispatch(
+            "POST",
+            f"/api/v2/research/{research_id}/preflight",
+            {"expected_revision": 1},
+        )
+        self.assertEqual(response.status, 422)
+        self.assertEqual(response.payload["code"], "artifact_required")
+
     def test_invalid_payload_returns_422(self) -> None:
         response = self.api.dispatch("POST", "/api/v2/research", {"workflow_mode": "legacy"})
         self.assertEqual(response.status, 422)
@@ -93,4 +144,3 @@ class ResearchV2ApiTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -154,6 +154,26 @@ class ResearchRepository:
             except Exception as exc:
                 raise RuntimeError(f"修订版本不可读：{research_id}@{target}") from exc
 
+    def artifact_path(self, research_id: str, artifact_id: str) -> Path:
+        research_id = self.validate_research_id(research_id)
+        artifact_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(artifact_id))
+        return self.project_dir(research_id) / "data" / "artifacts" / f"{artifact_id}.artifact"
+
+    def store_artifact(self, research_id: str, artifact_id: str, content: str | bytes) -> Path:
+        path = self.artifact_path(research_id, artifact_id)
+        payload = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+        tmp.write_bytes(payload)
+        os.replace(tmp, path)
+        return path
+
+    def read_artifact(self, research_id: str, artifact_id: str) -> bytes:
+        path = self.artifact_path(research_id, artifact_id)
+        if not path.is_file():
+            raise ResearchProjectNotFoundError(artifact_id)
+        return path.read_bytes()
+
     def list_projects(self) -> list[ResearchProject]:
         projects: list[ResearchProject] = []
         for manifest_path in sorted(self.root.glob("*/manifest.json")):

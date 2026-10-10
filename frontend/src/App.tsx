@@ -9,6 +9,8 @@ import { ExecutionPage } from './pages/ExecutionPage'
 import { HypothesisPage } from './pages/HypothesisPage'
 import { UncertaintyPage } from './pages/UncertaintyPage'
 import { DataDictionaryConfigPage } from './pages/DataDictionaryConfigPage'
+import { ResearchWorkspacePage } from './pages/ResearchWorkspacePage'
+import { EvidenceCenterPage } from './pages/EvidenceCenterPage'
 import { Routes, Route, useParams } from 'react-router-dom'
 
 function NodeDetailRoute() {
@@ -34,6 +36,9 @@ function App() {
       <Route path="/execution" element={<ExecutionPage />} />
       <Route path="/report" element={<RoundReportPage />} />
       <Route path="/node/:roundId/:nodeId" element={<NodeDetailRoute />} />
+      <Route path="/research" element={<ResearchWorkspacePage />} />
+      <Route path="/research/:researchId" element={<ResearchWorkspacePage />} />
+      <Route path="/research/:researchId/evidence" element={<EvidenceCenterPage />} />
     </Routes>
   )
 }
