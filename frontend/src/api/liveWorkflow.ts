@@ -3,7 +3,7 @@ const LOCAL_API_ORIGIN =
     ? 'http://127.0.0.1:8765'
     : ''
 
-const API_ROOT =
+export const API_ROOT =
   typeof import.meta !== 'undefined'
     ? import.meta.env.VITE_WORKFLOW_API_BASE?.trim() ?? (LOCAL_API_ORIGIN ? `${LOCAL_API_ORIGIN}/api` : '/api')
     : ''

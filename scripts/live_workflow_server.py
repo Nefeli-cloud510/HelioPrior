@@ -28,6 +28,7 @@ from core.display_text_cleaner import clean_repository_text
 from core.llm_gateway import LLMGateway
 from core.method_registry import METHOD_REGISTRY
 from core.multi_source_uncertainty_miner import MIN_UNCERTAINTIES
+from core.research_api import ResearchV2Api
 from core.runtime_config import get_default_llm_model, get_llm_role_models, load_project_env
 from core.state_repository import UnifiedStateRepository
 from core.unified_schema import (
@@ -1948,6 +1949,7 @@ class LiveSessionManager:
 
 
 SESSION_MANAGER = LiveSessionManager()
+RESEARCH_V2_API = ResearchV2Api()
 
 
 class LiveWorkflowHandler(BaseHTTPRequestHandler):
@@ -1963,7 +1965,7 @@ class LiveWorkflowHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Idempotency-Key, X-Request-ID")
         for name, value in extra_headers or []:
             self.send_header(name, value)
         self.end_headers()
@@ -1975,6 +1977,9 @@ class LiveWorkflowHandler(BaseHTTPRequestHandler):
         self._set_headers()
 
     def do_GET(self) -> None:
+        if self.path.startswith("/api/v2"):
+            self._handle_v2("GET")
+            return
         if self.path == "/api/health":
             self._write_json({"status": "ok", "service": "live_workflow_server"})
             return
@@ -2007,6 +2012,9 @@ class LiveWorkflowHandler(BaseHTTPRequestHandler):
         self._write_json({"message": "Not Found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
+        if self.path.startswith("/api/v2"):
+            self._handle_v2("POST")
+            return
         if self.path == "/api/session/reset":
             try:
                 payload = self._read_json_body()
@@ -2064,6 +2072,25 @@ class LiveWorkflowHandler(BaseHTTPRequestHandler):
             self._handle_uncertainty_recovery("manual")
             return
         self._write_json({"message": "Not Found"}, status=HTTPStatus.NOT_FOUND)
+
+    def _handle_v2(self, method: str) -> None:
+        try:
+            payload = self._read_json_body() if method == "POST" else {}
+        except ValueError as exc:
+            self._write_json(
+                {
+                    "request_id": "",
+                    "code": "invalid_json",
+                    "message": str(exc),
+                    "retryable": False,
+                    "details": {},
+                },
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        idempotency_key = self.headers.get("Idempotency-Key")
+        result = RESEARCH_V2_API.dispatch(method, self.path, payload, idempotency_key=idempotency_key)
+        self._write_json(result.payload, status=result.status)
 
     def _write_json(self, payload: dict[str, Any], status: int = HTTPStatus.OK) -> None:
         self._set_headers(status=status)
