@@ -157,6 +157,29 @@ export interface ValidationCandidate {
   rationale?: string
 }
 
+export interface ValidationPlan {
+  batch_id: string
+  is_stub: boolean
+  candidate_ids: string[]
+  message?: string
+  candidates: ValidationCandidate[]
+  protocols: ProtocolSnapshot[]
+}
+
+export interface ResearchApproval {
+  candidate_id?: string | null
+  protocol_hash?: string
+  status?: string
+  decision?: ResearchDecision | null
+}
+
+export interface ResearchExecution {
+  candidate_id?: string | null
+  protocol_hash?: string
+  status?: string
+  job?: JobRecord | null
+}
+
 export interface ResearchDecision {
   decision_id: string
   actor_type: string
@@ -192,6 +215,22 @@ export interface AgentCallRecord {
   error_code?: string
   error_message?: string
   cache_hit?: boolean
+}
+
+export interface ResearchReviewRecord {
+  review_id: string
+  status: string
+  stage?: string
+  packet_hash?: string
+  claim_id?: string
+  request_hash?: string
+  is_stub: boolean
+  message?: string
+  job?: JobRecord
+  opinions: ReviewOpinion[]
+  disputes: ResearchDispute[]
+  arbitrations: ResearchArbitration[]
+  agent_calls: AgentCallRecord[]
 }
 
 export interface ReviewOpinion {
@@ -363,6 +402,21 @@ export interface PreflightResult {
   }
   blocking_issues: PreflightBlockingIssue[]
 }
+
+export interface DisputeListResponse {
+  research_id: string
+  revision: number
+  project: ResearchProjectDetail['project']
+  disputes: ResearchDispute[]
+  opinions: ReviewOpinion[]
+  arbitrations: ResearchArbitration[]
+  open_dispute_count: number
+}
+
+export type StartReviewResponse = ResearchProjectDetail & { review: ResearchReviewRecord }
+export type ValidationPlanResponse = ResearchProjectDetail & { validation_plan: ValidationPlan }
+export type ResearchApprovalResponse = ResearchProjectDetail & { approval: ResearchApproval }
+export type ResearchExecutionResponse = ResearchProjectDetail & { execution: ResearchExecution }
 
 export type ResearchProjectView = ResearchProjectDetail
 

@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { getResearchProject } from '../api/researchApi'
+import { EvidenceDrawer } from '../components/EvidenceDrawer'
+import { EvidenceTimeline } from '../components/EvidenceTimeline'
+import { ResearchNav } from '../components/ResearchNav'
 import type {
   EvidenceCheck,
   EvidencePacket,
@@ -65,6 +68,7 @@ export function EvidenceCenterPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<EvidenceTab>('data_time')
+  const [drawer, setDrawer] = useState<{ packetHash?: string; evidenceKey?: string } | null>(null)
 
   async function refresh() {
     if (!researchId) {
@@ -87,10 +91,22 @@ export function EvidenceCenterPage() {
     void refresh()
   }, [researchId])
 
+  const packets = useMemo(() => project?.evidence_packets ?? [], [project?.evidence_packets])
   const packet: EvidencePacket | null = useMemo(() => {
-    const list = project?.evidence_packets ?? []
-    return list.length > 0 ? list[list.length - 1] : null
-  }, [project?.evidence_packets])
+    if (drawer?.packetHash) {
+      return packets.find(
+        (item) => item.packet_hash === drawer.packetHash || item.packet_id === drawer.packetHash,
+      ) ?? null
+    }
+    return packets.length > 0 ? packets[packets.length - 1] : null
+  }, [packets, drawer?.packetHash])
+
+  const drawerEvidence = useMemo(() => {
+    if (!drawer?.evidenceKey) {
+      return null
+    }
+    return packet?.evidence_items.find((item) => item.evidence_id === drawer.evidenceKey) ?? null
+  }, [drawer?.evidenceKey, packet])
 
   if (loading && !project) {
     return (
@@ -152,6 +168,8 @@ export function EvidenceCenterPage() {
             </div>
           </header>
 
+          <ResearchNav researchId={project.project.research_id} active="evidence" />
+
           <div className="research-tabbar" style={{ marginTop: 18 }}>
             {TAB_LABELS.map((tab) => (
               <button
@@ -169,6 +187,16 @@ export function EvidenceCenterPage() {
             <div className="research-empty">
               当前项目还没有证据包。请先在项目总览导入预测 CSV 并运行证据预检。
             </div>
+          ) : null}
+
+          {activeTab === 'data_time' ? (
+            <section className="detail-card">
+              <div className="detail-card__title-row">
+                <h2>证据时间轴</h2>
+                <span className="badge">{packets.length} 个证据包</span>
+              </div>
+              <EvidenceTimeline packets={packets} onOpenPacket={(item) => setDrawer({ packetHash: item.packet_hash })} />
+            </section>
           ) : null}
 
           {activeTab === 'data_time' ? (
@@ -248,7 +276,12 @@ export function EvidenceCenterPage() {
                   </p>
                   <div className="research-metrics">
                     {Object.entries(packet.metrics).map(([key, metric]) => (
-                      <div key={key} className="metric-box">
+                      <button
+                        key={key}
+                        type="button"
+                        className="metric-box metric-box--button"
+                        onClick={() => setDrawer({ packetHash: packet.packet_hash, evidenceKey: key })}
+                      >
                         <div className="metric-box__label">{key}</div>
                         <div className="metric-box__value">
                           {metric.value === null || metric.value === undefined
@@ -259,7 +292,7 @@ export function EvidenceCenterPage() {
                           {metric.unit ?? '无单位'}
                           {metric.reason ? ` · ${metric.reason}` : ''}
                         </div>
-                      </div>
+                      </button>
                     ))}
                   </div>
                   {packet.limitations.length > 0 ? (
@@ -312,24 +345,35 @@ export function EvidenceCenterPage() {
                   <h2 style={{ fontSize: 18, margin: '18px 0 10px' }}>证据项</h2>
                   <ul className="research-material-list">
                     {packet.evidence_items.map((item) => (
-                      <li key={item.evidence_id} className="research-material-item">
-                        <div className="research-check-item__top">
-                          <code>{item.evidence_id}</code>
-                          <span className="badge">{item.value_type}</span>
-                        </div>
-                        <p>
-                          {String(item.value ?? '—')}
-                          {item.unit ? ` ${item.unit}` : ''}
-                        </p>
-                        <div className="detail-card__meta">
-                          {item.locator ?? '无定位'} · {item.provenance ?? '来源未知'}
-                        </div>
+                      <li key={item.evidence_id} className="research-material-item evidence-item-button">
+                        <button type="button" onClick={() => setDrawer({ packetHash: packet.packet_hash, evidenceKey: item.evidence_id })}>
+                          <div className="research-check-item__top">
+                            <code>{item.evidence_id}</code>
+                            <span className="badge">{item.value_type}</span>
+                          </div>
+                          <p>
+                            {String(item.value ?? '—')}
+                            {item.unit ? ` ${item.unit}` : ''}
+                          </p>
+                          <div className="detail-card__meta">
+                            {item.locator ?? '无定位'} · {item.provenance ?? '来源未知'} · 打开证据抽屉
+                          </div>
+                        </button>
                       </li>
                     ))}
                   </ul>
                 </>
               ) : null}
             </section>
+          ) : null}
+
+          {drawer ? (
+            <EvidenceDrawer
+              packet={packet}
+              evidence={drawerEvidence}
+              metricKey={drawer.evidenceKey}
+              onClose={() => setDrawer(null)}
+            />
           ) : null}
         </main>
       </div>

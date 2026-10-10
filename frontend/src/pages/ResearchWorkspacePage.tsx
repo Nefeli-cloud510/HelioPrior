@@ -10,6 +10,7 @@ import {
   runResearchPreflight,
   uploadResearchArtifact,
 } from '../api/researchApi'
+import { ResearchNav } from '../components/ResearchNav'
 import type {
   ArtifactKind,
   ArtifactRecord,
@@ -748,6 +749,8 @@ function ResearchProjectDetailView({ researchId }: { researchId: string }) {
               <span className="detail-card__meta">{project.project.research_id}</span>
             </div>
           </header>
+
+          <ResearchNav researchId={researchId} active="overview" />
 
           {actionError ? <div className="research-banner research-banner--error">{actionError}</div> : null}
           {actionNotice ? <div className="research-banner research-banner--success">{actionNotice}</div> : null}

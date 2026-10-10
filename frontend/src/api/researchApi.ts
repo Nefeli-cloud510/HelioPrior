@@ -5,11 +5,20 @@ import type {
   ClaimStatus,
   ClaimVersionHistory,
   CreateResearchPayload,
+  DisputeListResponse,
   PreflightResult,
+  ResearchApproval,
+  ResearchApprovalResponse,
   ResearchDecision,
+  ResearchExecution,
+  ResearchExecutionResponse,
   ResearchReport,
+  ResearchReviewRecord,
   ResearchProjectDetail,
   ResearchProjectSummary,
+  StartReviewResponse,
+  ValidationPlan,
+  ValidationPlanResponse,
   V2ApiEnvelope,
 } from '../types/research'
 import { ResearchApiError } from '../types/research'
@@ -153,6 +162,172 @@ export async function runResearchPreflight(
   return {
     project: response.data,
     preflight: response.data.preflight,
+  }
+}
+
+export interface RunResearchReviewPayload {
+  artifact_id?: string
+  packet_hash?: string
+  claim_id?: string
+}
+
+export async function runResearchReview(
+  researchId: string,
+  expectedRevision: number,
+  payload: RunResearchReviewPayload = {},
+): Promise<{ project: ResearchProjectDetail; review: ResearchReviewRecord }> {
+  const response = await v2Request<StartReviewResponse>(
+    `/research/${encodeURIComponent(researchId)}/reviews`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_revision: expectedRevision,
+        ...payload,
+      }),
+    },
+  )
+  if (!response.data?.review) {
+    throw new ResearchApiError('复核已启动但未返回复核记录。', 'missing_review', false)
+  }
+  return {
+    project: response.data,
+    review: response.data.review,
+  }
+}
+
+export interface RetryResearchReviewPayload {
+  retry_roles?: string[]
+  attempt?: number
+  packet_hash?: string
+  claim_id?: string
+}
+
+export async function retryResearchReview(
+  researchId: string,
+  expectedRevision: number,
+  reviewId: string,
+  payload: RetryResearchReviewPayload = {},
+): Promise<{ project: ResearchProjectDetail; review: ResearchReviewRecord }> {
+  const response = await v2Request<StartReviewResponse>(
+    `/research/${encodeURIComponent(researchId)}/reviews/${encodeURIComponent(reviewId)}/retry`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_revision: expectedRevision,
+        retry_roles: payload.retry_roles,
+        attempt: payload.attempt,
+        packet_hash: payload.packet_hash,
+        claim_id: payload.claim_id,
+      }),
+    },
+  )
+  if (!response.data?.review) {
+    throw new ResearchApiError('复核重试后未返回复核记录。', 'missing_review', false)
+  }
+  return {
+    project: response.data,
+    review: response.data.review,
+  }
+}
+
+export async function listResearchDisputes(researchId: string): Promise<DisputeListResponse> {
+  const response = await v2Request<DisputeListResponse>(
+    `/research/${encodeURIComponent(researchId)}/disputes`,
+  )
+  if (!response.data) {
+    throw new ResearchApiError('分歧清单数据为空。', 'empty_disputes', false)
+  }
+  return response.data
+}
+
+export interface PlanResearchValidationsPayload {
+  dispute_ids?: string[]
+  template_id?: string
+  design_hints?: string[]
+  model?: string
+}
+
+export async function planResearchValidations(
+  researchId: string,
+  expectedRevision: number,
+  payload: PlanResearchValidationsPayload = {},
+): Promise<{ project: ResearchProjectDetail; plan: ValidationPlan }> {
+  const response = await v2Request<ValidationPlanResponse>(
+    `/research/${encodeURIComponent(researchId)}/plans`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_revision: expectedRevision,
+        ...payload,
+      }),
+    },
+  )
+  if (!response.data?.validation_plan) {
+    throw new ResearchApiError('验证任务规划后未返回计划。', 'missing_validation_plan', false)
+  }
+  return {
+    project: response.data,
+    plan: response.data.validation_plan,
+  }
+}
+
+export interface ApproveResearchProtocolPayload {
+  protocol_hash: string
+  candidate_id?: string
+  rationale?: string
+  actor_type?: string
+}
+
+export async function approveResearchProtocol(
+  researchId: string,
+  expectedRevision: number,
+  payload: ApproveResearchProtocolPayload,
+): Promise<{ project: ResearchProjectDetail; approval: ResearchApproval }> {
+  const response = await v2Request<ResearchApprovalResponse>(
+    `/research/${encodeURIComponent(researchId)}/approvals`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_revision: expectedRevision,
+        ...payload,
+      }),
+    },
+  )
+  if (!response.data?.approval) {
+    throw new ResearchApiError('批准提交后未返回结果。', 'missing_approval', false)
+  }
+  return {
+    project: response.data,
+    approval: response.data.approval,
+  }
+}
+
+export interface ExecuteResearchProtocolPayload {
+  protocol_hash: string
+  candidate_id?: string
+}
+
+export async function executeResearchProtocol(
+  researchId: string,
+  expectedRevision: number,
+  payload: ExecuteResearchProtocolPayload,
+): Promise<{ project: ResearchProjectDetail; execution: ResearchExecution }> {
+  const response = await v2Request<ResearchExecutionResponse>(
+    `/research/${encodeURIComponent(researchId)}/executions`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_revision: expectedRevision,
+        ...payload,
+      }),
+    },
+  )
+  if (!response.data?.execution) {
+    throw new ResearchApiError('验证执行后未返回结果。', 'missing_execution', false)
+  }
+  return {
+    project: response.data,
+    execution: response.data.execution,
   }
 }
 

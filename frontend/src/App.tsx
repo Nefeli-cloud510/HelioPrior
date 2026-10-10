@@ -11,6 +11,9 @@ import { UncertaintyPage } from './pages/UncertaintyPage'
 import { DataDictionaryConfigPage } from './pages/DataDictionaryConfigPage'
 import { ResearchWorkspacePage } from './pages/ResearchWorkspacePage'
 import { EvidenceCenterPage } from './pages/EvidenceCenterPage'
+import { ReviewPage } from './pages/ReviewPage'
+import { ValidationPage } from './pages/ValidationPage'
+import { ReportPage } from './pages/ReportPage'
 import { Routes, Route, useParams } from 'react-router-dom'
 
 function NodeDetailRoute() {
@@ -39,6 +42,9 @@ function App() {
       <Route path="/research" element={<ResearchWorkspacePage />} />
       <Route path="/research/:researchId" element={<ResearchWorkspacePage />} />
       <Route path="/research/:researchId/evidence" element={<EvidenceCenterPage />} />
+      <Route path="/research/:researchId/review" element={<ReviewPage />} />
+      <Route path="/research/:researchId/validate" element={<ValidationPage />} />
+      <Route path="/research/:researchId/report" element={<ReportPage />} />
     </Routes>
   )
 }
